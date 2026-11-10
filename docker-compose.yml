@@ -1,0 +1,49 @@
+services:
+  # The aggregator. Scrapes nothing itself: it wraps the source addons you give
+  # it and presents one merged, sorted list. Runs on the same host as the
+  # failover addon so the addon can reach it over loopback.
+  aiostreams:
+    image: ghcr.io/viren070/aiostreams:latest
+    container_name: aiostreams
+    restart: unless-stopped
+    ports:
+      - "3817:3000"
+    environment:
+      # BASE_URL is what the manifest URLs inside the hub point at: it must be
+      # an address your player can reach, not localhost, unless the player is
+      # on the same machine.
+      BASE_URL: ${BASE_URL:?set BASE_URL, e.g. http://192.168.1.10:3817}
+      PORT: "3000"
+      # Generates the key that encrypts stored configurations. Changing it
+      # after the first run invalidates every manifest URL already installed.
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY, e.g. $(openssl rand -hex 32)}
+
+  # Stremio's own streaming server. Without it a browser client has no torrent
+  # engine at all, so every P2P source stalls no matter how fast the addons are.
+  stremio-server:
+    image: stremio/server:latest
+    container_name: stremio-server
+    restart: unless-stopped
+    ports:
+      - "11470:11470"
+
+  # The one entry the player sees. Points at the hub above and at the streaming
+  # server, and does the ranking and the failover itself.
+  aiostrem:
+    build: ./addon
+    container_name: aiostrem
+    restart: unless-stopped
+    depends_on:
+      - aiostreams
+      - stremio-server
+    ports:
+      - "3819:3819"
+    environment:
+      PORT: "3819"
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL, e.g. http://192.168.1.10:3819}
+      # The hub's own manifest URL, copied from its configure page after you
+      # have saved a configuration.
+      HUB_URL: ${HUB_URL:?set HUB_URL to the AIOStreams manifest URL}
+      STREAMING_URL: ${STREAMING_URL:-http://stremio-server:11470}
+      PROBE_MS: "2500"
+      WANT: "12"
