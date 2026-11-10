@@ -1,0 +1,23 @@
+[Unit]
+Description=AIOStream: one Stremio stream per title, ranked and failed over on the backend
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/aiostrem
+# PUBLIC_URL must be an address the player can reach (LAN IP, not localhost,
+# unless player and addon run on the same machine).
+Environment=PORT=3819
+Environment=PUBLIC_URL=http://127.0.0.1:3819
+Environment=STREAMING_URL=http://127.0.0.1:11470
+# Copy the manifest URL from the AIOStreams configure page after saving a config.
+Environment=HUB_URL=
+Environment=PROBE_MS=2500
+Environment=WANT=12
+ExecStart=/usr/bin/env node %h/.local/share/aiostrem/server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
