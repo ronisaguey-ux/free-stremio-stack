@@ -1,0 +1,15 @@
+{
+  "name": "aiostrem",
+  "version": "1.0.0",
+  "description": "One Stremio stream per title: the backend ranks every source, picks the best one that answers, and keeps a fallback list behind it.",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
