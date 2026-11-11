@@ -66,10 +66,11 @@ the hub is a backend now, not something the player should see.
 | --- | --- | --- |
 | `HUB_URL` | — | AIOStreams manifest URL |
 | `PUBLIC_URL` | — | Address players use to reach this addon |
-| `STREAMING_URL` | `http://127.0.0.1:11470` | Stremio streaming server |
+| `STREAMING_URL` | `http://127.0.0.1:11470` | Stremio streaming server. **Use the LAN address** if any player is not on the same host: `127.0.0.1` on a TV means the TV. |
 | `PORT` | `3819` | Listen port |
 | `PROBE_MS` | `2500` | Direct-link probe timeout |
 | `WANT` | `12` | Candidates kept for fallback |
+| `MIN_SEEDERS` | `3` | Below this a torrent is demoted under every well-seeded source |
 
 ## Endpoints
 
