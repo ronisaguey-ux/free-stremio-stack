@@ -18,6 +18,7 @@ const HUB = process.env.HUB_URL;           // .../manifest.json
 const STREAMING = process.env.STREAMING_URL || 'http://127.0.0.1:11470';
 const PROBE_MS = Number(process.env.PROBE_MS || 2500);
 const WANT = Number(process.env.WANT || 12);
+const MIN_SEEDERS = Number(process.env.MIN_SEEDERS || 3);
 const ADDON_NAME = 'AIOStream';
 
 if (!HUB) {
@@ -31,13 +32,34 @@ const attempts = new Map(); // "type:id" -> how far down the list we have walked
 const QUALITY = ['2160p', '1440p', '1080p', '720p', '576p', '480p', '360p'];
 const TIER = ['remux', 'bluray', 'web-dl', 'webrip', 'hdrip', 'dvdrip', 'hdtv', 'cam', 'ts'];
 
+// A source that answers with a sign-in page or a placeholder clip is worse
+// than no source: it plays, it looks like a film, and it is not one.
+const PLACEHOLDER = /(signin|sign-in|login|signup|sign-up|placeholder|sample\.mp4)/i;
+const MEDIA = /\.(mp4|mkv|avi|webm|m3u8|ts)(\?|$)/i;
+
+function isPlaceholder(stream) {
+  const url = stream.url || '';
+  return PLACEHOLDER.test(url);
+}
+
+function isMediaLink(stream) {
+  return Boolean(stream.url) && MEDIA.test(stream.url) && !isPlaceholder(stream);
+}
+
 function rank(stream) {
   const text = `${stream.name || ''} ${stream.title || ''}`.toLowerCase();
   const q = QUALITY.findIndex((token) => text.includes(token));
   const t = TIER.findIndex((token) => text.includes(token));
-  const p2p = stream.infoHash ? 1 : 0;          // a direct link starts sooner than a swarm
-  const seeders = Number((/(?:👤|seeders?[:\s]+)(\d+)/.exec(stream.title || '') || [])[1] || 0);
-  return [q === -1 ? 99 : q, t === -1 ? 99 : t, p2p, -seeders];
+  const p2p = isMediaLink(stream) ? 0 : 1;     // a real file link starts sooner than a swarm
+  // The hub writes the swarm size in the description, not the title.
+  const seeders = Number(
+    (/(?:👥|👤|seeders?[:\s]+)\s*(\d+)/.exec(`${stream.title || ''} ${stream.description || ''}`) || [])[1] || 0,
+  );
+  // A 4K torrent with two peers is not the "highest quality" anything: it is a
+  // buffer. A swarm nobody is in is demoted below every source people are
+  // actually seeding, however good its resolution reads.
+  const lonely = stream.infoHash && seeders < MIN_SEEDERS ? 1 : 0;
+  return [lonely, q === -1 ? 99 : q, t === -1 ? 99 : t, p2p, -seeders];
 }
 
 function better(a, b) {
@@ -96,7 +118,9 @@ function alive(url) {
 
 async function candidates(type, id) {
   const body = await get(`${HUB_BASE}/stream/${type}/${id}.json`, 15000);
-  const streams = (body.streams || []).filter((stream) => stream.url || stream.infoHash);
+  const streams = (body.streams || [])
+    .filter((stream) => stream.url || stream.infoHash)
+    .filter((stream) => !isPlaceholder(stream));
   streams.sort(better);
   return streams.slice(0, WANT);
 }
@@ -144,12 +168,20 @@ const server = http.createServer(async (req, res) => {
       }
       const top = list[0];
       const label = `${ADDON_NAME} · ${(top.name || '').replace(/^\[[^\]]*\]\s*/, '').slice(0, 28)}`;
-      const streams = [{
-        name: ADDON_NAME,
-        title: label,
-        url: `${PUBLIC}/play/${type}/${encodeURIComponent(id)}`,
-        behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
-      }];
+      // A native client has its own torrent engine and plays peer to peer far
+      // better than a LAN hop through this host's streaming server. A browser
+      // has none, so it gets the redirect. The user agent is the only signal a
+      // Stremio addon is given about who is asking.
+      const ua = String(req.headers['user-agent'] || '');
+      const native = /Stremio/i.test(ua) && !/Chrome|Mozilla|Safari/i.test(ua);
+      const streams = [native
+        ? { ...top, name: ADDON_NAME, title: label, behaviorHints: { bingeGroup: 'aiostre-am' } }
+        : {
+            name: ADDON_NAME,
+            title: label,
+            url: `${PUBLIC}/play/${type}/${encodeURIComponent(id)}`,
+            behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
+          }];
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
       res.end(JSON.stringify({ streams }));
       return;
