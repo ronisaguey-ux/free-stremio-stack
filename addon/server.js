@@ -46,8 +46,11 @@ function isMediaLink(stream) {
   return Boolean(stream.url) && MEDIA.test(stream.url) && !isPlaceholder(stream);
 }
 
-function rank(stream) {
-  const text = `${stream.name || ''} ${stream.title || ''}`.toLowerCase();
+function rank(stream, browser) {
+  const text = `${stream.name || ''} ${stream.title || ''} ${stream.description || ''}`.toLowerCase();
+  // A browser cannot decode HEVC at all and 10-bit HEVC in no case: the stream
+  // opens, the player shows nothing, and it looks like the addon hung.
+  const heavy = browser && /(hevc|h\.?265|x265|10 ?bit)/i.test(text);
   const q = QUALITY.findIndex((token) => text.includes(token));
   const t = TIER.findIndex((token) => text.includes(token));
   const p2p = isMediaLink(stream) ? 0 : 1;     // a real file link starts sooner than a swarm
@@ -59,12 +62,12 @@ function rank(stream) {
   // buffer. A swarm nobody is in is demoted below every source people are
   // actually seeding, however good its resolution reads.
   const lonely = stream.infoHash && seeders < MIN_SEEDERS ? 1 : 0;
-  return [lonely, q === -1 ? 99 : q, t === -1 ? 99 : t, p2p, -seeders];
+  return [lonely, heavy ? 1 : 0, q === -1 ? 99 : q, t === -1 ? 99 : t, p2p, -seeders];
 }
 
 function better(a, b) {
-  const ra = rank(a);
-  const rb = rank(b);
+  const ra = rank(a, a.browser);
+  const rb = rank(b, b.browser);
   for (let i = 0; i < ra.length; i += 1) {
     if (ra[i] !== rb[i]) return ra[i] - rb[i];
   }
@@ -99,6 +102,47 @@ function get(url, timeoutMs) {
   });
 }
 
+// A torrent the streaming server has loaded still has to carry bytes. A swarm
+// of three peers can deliver four kilobytes a second, and the player sits on a
+// spinner for a minute before it gives up. So the first kilobytes are read here
+// first: a source that cannot deliver them in a few seconds is treated as dead
+// and the next one is tried, before the player ever sees a URL.
+function delivers(url, need, within) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let got = 0;
+    const target = new URL(url);
+    const lib = target.protocol === 'https:' ? https : http;
+    const req = lib.get(url, { headers: { range: 'bytes=0-262143', 'user-agent': 'aio-failover/1.0' } }, (res) => {
+      if (res.statusCode >= 400) {
+        res.resume();
+        resolve(false);
+        return;
+      }
+      res.on('data', (chunk) => {
+        got += chunk.length;
+        if (got >= need) {
+          req.destroy();
+          resolve(true);
+        }
+      });
+      res.on('end', () => resolve(got >= need));
+    });
+    const timer = setInterval(() => {
+      if (Date.now() - started > within) {
+        clearInterval(timer);
+        req.destroy();
+        resolve(got >= need);
+      }
+    }, 200);
+    req.on('error', () => {
+      clearInterval(timer);
+      resolve(false);
+    });
+    req.on('close', () => clearInterval(timer));
+  });
+}
+
 // A direct link is checked with a ranged GET: a dead host or a 403 must not be
 // handed to the player, and a few kilobytes is enough to know the link is real.
 function alive(url) {
@@ -116,11 +160,12 @@ function alive(url) {
   });
 }
 
-async function candidates(type, id) {
+async function candidates(type, id, browser) {
   const body = await get(`${HUB_BASE}/stream/${type}/${id}.json`, 15000);
   const streams = (body.streams || [])
     .filter((stream) => stream.url || stream.infoHash)
-    .filter((stream) => !isPlaceholder(stream));
+    .filter((stream) => !isPlaceholder(stream))
+    .map((stream) => ({ ...stream, browser }));
   streams.sort(better);
   return streams.slice(0, WANT);
 }
@@ -160,7 +205,9 @@ const server = http.createServer(async (req, res) => {
     const streamMatch = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
     if (streamMatch) {
       const [, type, id] = streamMatch;
-      const list = await candidates(type, id);
+      const uaStream = String(req.headers['user-agent'] || '');
+      const isBrowser = /Chrome|Mozilla|Safari|Firefox/i.test(uaStream);
+      const list = await candidates(type, id, isBrowser);
       if (!list.length) {
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
         res.end(JSON.stringify({ streams: [] }));
@@ -192,20 +239,25 @@ const server = http.createServer(async (req, res) => {
       const [, type, rawId] = playMatch;
       const id = decodeURIComponent(rawId);
       const key = `${type}:${id}`;
-      const list = await candidates(type, id);
+      const list = await candidates(type, id, true);
       if (!list.length) {
         res.writeHead(502, { 'content-type': 'text/plain' });
         res.end('no sources');
         return;
       }
-      let start = attempts.get(key) || 0;
+      const now = Date.now();
+      const last = attempts.get(key);
+      // A player often asks twice for the same title within a second (manifest
+      // probe, then play). Treating that as a failure skipped a good source and
+      // walked the list for no reason.
+      let start = last && now - last.at < 4000 ? last.index : (last ? last.index : 0);
       for (let step = 0; step < list.length; step += 1) {
         const at = (start + step) % list.length;
         const stream = list[at];
         const target = playUrl(stream);
-        const ok = stream.url ? await alive(target) : true;
+        const ok = stream.url ? await alive(target) : await delivers(target, 32 * 1024, 2500);
         if (ok) {
-          attempts.set(key, at + 1);
+          attempts.set(key, { index: at + 1, at: Date.now() });
           console.log(`play ${key} -> #${at} ${target.slice(0, 90)}`);
           res.writeHead(302, { location: target, 'access-control-allow-origin': '*' });
           res.end();
@@ -213,7 +265,7 @@ const server = http.createServer(async (req, res) => {
         }
         console.log(`dead ${key} #${at} ${target.slice(0, 90)}`);
       }
-      attempts.set(key, start + 1);
+      attempts.set(key, { index: start + 1, at: Date.now() });
       res.writeHead(504, { 'content-type': 'text/plain' });
       res.end('no source answered');
       return;
