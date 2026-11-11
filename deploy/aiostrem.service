@@ -10,7 +10,9 @@ WorkingDirectory=%h/.local/share/aiostrem
 # unless player and addon run on the same machine).
 Environment=PORT=3819
 Environment=PUBLIC_URL=http://127.0.0.1:3819
-Environment=STREAMING_URL=http://127.0.0.1:11470
+# LAN address, not localhost: a player on another device resolves localhost to
+# itself and hangs with nothing in the log.
+Environment=STREAMING_URL=http://192.168.86.49:11470
 # Copy the manifest URL from the AIOStreams configure page after saving a config.
 Environment=HUB_URL=
 Environment=PROBE_MS=2500

@@ -13,15 +13,32 @@ which one is best, what happens when it dies — lives here, on the server.
 
 ## Ranking
 
-Each candidate is scored on four keys, compared left to right:
+Each candidate is scored on five keys, compared left to right:
 
-1. **Resolution** — 2160p, 1440p, 1080p, 720p, 576p, 480p, 360p, then unknown.
-2. **Quality tier** — remux, bluray, web-dl, webrip, hdrip, dvdrip, hdtv, cam, ts.
-3. **Transport** — a direct HTTP link starts immediately; a torrent waits for peers.
-4. **Seeders** — for torrents, more is sooner.
+1. **Alive swarm** — a torrent with fewer than `MIN_SEEDERS` peers (default 3) drops
+   below every source people are actually seeding, whatever its resolution says.
+   A 4K with two peers is not high quality, it is a buffer.
+2. **Resolution** — 2160p, 1440p, 1080p, 720p, 576p, 480p, 360p, then unknown.
+3. **Quality tier** — remux, bluray, web-dl, webrip, hdrip, dvdrip, hdtv, cam, ts.
+4. **Transport** — a real media link (`.mp4`, `.mkv`, `.m3u8`, …) starts immediately;
+   a torrent waits for peers.
+5. **Seeders** — for torrents, more is sooner.
+
+A source whose URL is a sign-in page or a placeholder clip is not a candidate at
+all: it plays, it looks like a film, and it is not one.
 
 The list is truncated to `WANT` (default 12) before anything is handed out. The
 first entry is what the player is told about; the rest are the fallback.
+
+## Who is asking
+
+A browser has no torrent engine, so it must be handed a URL the streaming server
+can serve. A native client (Android TV, desktop) does have one, and plays peer to
+peer better than any LAN hop. The request's user agent is the only signal an addon
+gets, so:
+
+- native (`Stremio/*`, no browser strings) → **the torrent itself** (infohash + file index)
+- anything else → **`/play/...`**, which probes and redirects
 
 ## Fallback
 
