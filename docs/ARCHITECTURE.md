@@ -15,14 +15,18 @@ which one is best, what happens when it dies — lives here, on the server.
 
 Each candidate is scored on five keys, compared left to right:
 
-1. **Alive swarm** — a torrent with fewer than `MIN_SEEDERS` peers (default 3) drops
+1. **Decodable by the client** — a browser cannot decode HEVC at all and 10-bit
+   HEVC in no case. The stream opens, the player shows nothing, and it reads as
+   a hang. For a browser, H.264 ranks above every HEVC source; a native client
+   is left alone, because it does decode them.
+2. **Alive swarm** — a torrent with fewer than `MIN_SEEDERS` peers (default 3) drops
    below every source people are actually seeding, whatever its resolution says.
    A 4K with two peers is not high quality, it is a buffer.
-2. **Resolution** — 2160p, 1440p, 1080p, 720p, 576p, 480p, 360p, then unknown.
-3. **Quality tier** — remux, bluray, web-dl, webrip, hdrip, dvdrip, hdtv, cam, ts.
-4. **Transport** — a real media link (`.mp4`, `.mkv`, `.m3u8`, …) starts immediately;
+3. **Resolution** — 2160p, 1440p, 1080p, 720p, 576p, 480p, 360p, then unknown.
+4. **Quality tier** — remux, bluray, web-dl, webrip, hdrip, dvdrip, hdtv, cam, ts.
+5. **Transport** — a real media link (`.mp4`, `.mkv`, `.m3u8`, …) starts immediately;
    a torrent waits for peers.
-5. **Seeders** — for torrents, more is sooner.
+6. **Seeders** — for torrents, more is sooner.
 
 A source whose URL is a sign-in page or a placeholder clip is not a candidate at
 all: it plays, it looks like a film, and it is not one.
@@ -48,9 +52,13 @@ gets, so:
 2. Start at the attempt counter kept for that title.
 3. For a direct link, probe it with a 2.5 s ranged GET. A dead host, a 403 or a
    timeout is skipped, never shown to the player.
-4. For a torrent there is nothing to probe — the streaming server can only prove
-   it by playing — so it is offered as-is.
-5. Redirect (302) to the first candidate that passes, and move the counter past
+4. For a torrent, read its first 32 KB through the streaming server within
+   2.5 s. A swarm that cannot deliver that is a spinner, not a source: the next
+   candidate is tried before the player is given a URL at all.
+5. A player that asks twice within four seconds is asking once — the same
+   candidate is reused instead of being burned, so a good source is never
+   skipped because the client probed first.
+6. Redirect (302) to the first candidate that passes, and move the counter past
    it so the next attempt for the same title continues down the list.
 
 When every candidate has been tried the endpoint answers 504 and the counter
