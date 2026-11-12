@@ -208,9 +208,22 @@ function alive(url) {
 
 async function candidates(type, id, browser) {
   const body = await get(`${HUB_BASE}/stream/${type}/${id}.json`, 15000);
+  const EPISODE = /\bS\d{1,2}E\d{1,3}\b|\b\d{1,2}x\d{1,2}\b|\bSeason[ ._-]?\d{1,2}\b/i;
   const streams = (body.streams || [])
     .filter((stream) => stream.url || stream.infoHash)
     .filter((stream) => !isPlaceholder(stream))
+    // A movie id answered with a season pack is a spinner waiting to happen: the
+    // swarm is healthy and the episode is still unseeded at the offset the
+    // player seeks to. They are not dropped — sometimes an index maps a series
+    // id as a movie and they are all there is — but they queue behind anything
+    // that looks like the title itself.
+    .map((stream) => {
+      const name = `${stream.name || ''} ${stream.title || ''} ${stream.description || ''} ${
+        (stream.behaviorHints && stream.behaviorHints.filename) || ''
+      }`;
+      return { ...stream, episode: type === 'movie' && EPISODE.test(name) };
+    })
+    .sort((left, right) => Number(left.episode) - Number(right.episode))
     .map((stream) => ({ ...stream, browser }));
   streams.sort(better);
   return streams.slice(0, WANT);
@@ -259,9 +272,17 @@ async function firstLive(list, orderUnsorted) {
     const req = http.get(item.target, { headers: { 'user-agent': 'aio-failover/1.0' } });
     req.on('error', () => {});
     req.setTimeout(probeWindow + 2000, () => req.destroy());
-    open.push(req);
+    open.push({ req, hash: item.hash });
   }
-  const close = () => { for (const req of open) { try { req.destroy(); } catch (_) {} } };
+  // Everything but the winner is dropped. The winner's request is left open on
+  // purpose: it is what warmed the engine, and tearing it down makes the player
+  // pay the cold start all over again — a spinner that ends as "failed to play".
+  const close = (keepHash) => {
+    for (const { req, hash } of open) {
+      if (hash === keepHash) continue;
+      try { req.destroy(); } catch (_) {}
+    }
+  };
   const deadline = Date.now() + probeWindow;
   let best = null;
   while (Date.now() < deadline) {
@@ -287,10 +308,6 @@ async function firstLive(list, orderUnsorted) {
     // peers and no complete copy of the episode that was asked for. So the
     // fastest few are asked for their first kilobytes before one is handed over.
     if (best) {
-      const finalists = loaded
-        .map((item) => ({ item, rate }))
-        .length;
-      void finalists;
       close();
       const want = loaded.slice(0, 4);
       const race = await Promise.all(
