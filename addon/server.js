@@ -25,7 +25,7 @@ const MIN_SEEDERS = Number(process.env.MIN_SEEDERS || 3);
 // Probing is a race, not a walk: PROBES candidates at a time, each given
 // PROBE_MS, and the whole list abandoned after PROBE_DEADLINE_MS. A player that
 // waits eight seconds still tries; one that waits thirty has already hung.
-const PROBES = Number(process.env.PROBES || 24);
+const PROBES = Number(process.env.PROBES || 40);
 const PROBE_DEADLINE_MS = Number(process.env.PROBE_DEADLINE_MS || 7000);
 // A source is playable when some wire is actually delivering: peers that never
 // send look identical to a dead swarm to the player.
@@ -39,6 +39,11 @@ if (!HUB) {
 const HUB_BASE = HUB.replace(/\/manifest\.json$/, '');
 
 const attempts = new Map(); // "type:id" -> how far down the list we have walked
+// A title played twice within a few minutes must not pay the swarm's cold start
+// twice: the winning stream is remembered, and the next play goes straight to it
+// while the torrent is still delivering.
+const warm = new Map(); // "type:id" -> { target, at }
+const WARM_TTL_MS = Number(process.env.WARM_TTL_MS || 180000);
 
 const QUALITY = ['2160p', '1440p', '1080p', '720p', '576p', '480p', '360p'];
 const TIER = ['remux', 'bluray', 'web-dl', 'webrip', 'hdrip', 'dvdrip', 'hdtv', 'cam', 'ts'];
@@ -247,7 +252,7 @@ function playUrl(stream) {
 // load, not the sum of them.
 async function firstLive(list, orderUnsorted) {
   let order = orderUnsorted;
-  const probeWindow = Number(process.env.LIVE_WINDOW_MS || 10000);
+  const probeWindow = Number(process.env.LIVE_WINDOW_MS || 20000);
   // The hub's own count is a cheap ordering hint: a torrent the hub believes has
   // thirty seeders is a better first guess than one it lists as empty, even
   // though only the engine can decide.
@@ -412,6 +417,42 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const now = Date.now();
+      let remembered = warm.get(key);
+      if (remembered && now - remembered.at < WARM_TTL_MS) {
+        // A remembered stream is only worth reusing while its swarm is still
+        // there: an engine that lost its peers answers nothing, and trusting the
+        // memory turned a fast second play into a 502.
+        const memoHash = /\/([0-9a-f]{40})\//i.exec(remembered.target);
+        const known = memoHash ? await readStats() : null;
+        const memoRow = known && memoHash ? known[memoHash[1].toLowerCase()] : null;
+        if (!memoRow || Number(memoRow.peers || 0) === 0) {
+          warm.delete(key);
+          remembered = null;
+        }
+      }
+      if (remembered && now - remembered.at < WARM_TTL_MS) {
+        const fresh = `${remembered.target}${remembered.target.includes('?') ? '&' : '?'}n=${now}`;
+        console.log(`play ${key} -> warm ${fresh.slice(0, 60)}`);
+        const headers = { 'user-agent': 'aio-failover/1.0' };
+        if (req.headers.range) headers.range = req.headers.range;
+        const upstream = http.get(fresh, { headers }, (body) => {
+          res.writeHead(body.statusCode || 200, {
+            'content-type': body.headers['content-type'] || 'video/x-matroska',
+            'accept-ranges': 'bytes',
+            ...(body.headers['content-length'] ? { 'content-length': body.headers['content-length'] } : {}),
+            ...(body.headers['content-range'] ? { 'content-range': body.headers['content-range'] } : {}),
+            'access-control-allow-origin': '*',
+          });
+          body.pipe(res);
+        });
+        upstream.on('error', () => {
+          warm.delete(key);
+          if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+          res.end('source error');
+        });
+        res.on('close', () => upstream.destroy());
+        return;
+      }
       const last = attempts.get(key);
       // A player often asks twice for the same title within a second (manifest
       // probe, then play). Treating that as a failure skipped a good source and
@@ -429,51 +470,36 @@ const server = http.createServer(async (req, res) => {
       const live = await firstLive(list, order);
       if (live) {
         attempts.set(key, { index: live.at + 1, at: Date.now() });
-        // The player keys its resume position off the URL. The device was
-        // resuming 1.5 GB into an episode and waiting for a piece the swarm did
-        // not have, which is a spinner with no error. A fresh nonce makes each
-        // play a new stream, so it starts at zero.
+        // Proxied, not redirected. The player is on another device and a 302 to
+        // a second port is one more thing it can refuse: serving the bytes from
+        // this addon's own origin is what every player understands, and it keeps
+        // the request that warmed the engine alive for the whole playback.
         const fresh = `${live.target}${live.target.includes('?') ? '&' : '?'}n=${Date.now()}`;
         console.log(`play ${key} -> #${live.at} ${live.peers} peers ${Math.round(live.rate / 1024)} KB/s ${live.target.slice(0, 60)}`);
-        res.writeHead(302, { location: fresh, 'access-control-allow-origin': '*' });
-        res.end();
+        const headers = { 'user-agent': 'aio-failover/1.0' };
+        if (req.headers.range) headers.range = req.headers.range;
+        const upstream = http.get(fresh, { headers }, (body) => {
+          res.writeHead(body.statusCode || 200, {
+            'content-type': body.headers['content-type'] || 'video/x-matroska',
+            'accept-ranges': 'bytes',
+            ...(body.headers['content-length'] ? { 'content-length': body.headers['content-length'] } : {}),
+            ...(body.headers['content-range'] ? { 'content-range': body.headers['content-range'] } : {}),
+            'access-control-allow-origin': '*',
+          });
+          body.pipe(res);
+        });
+        upstream.on('error', () => {
+          if (!res.headersSent) {
+            res.writeHead(502, { 'content-type': 'text/plain' });
+          }
+          res.end('source error');
+        });
+        res.on('close', () => upstream.destroy());
         return;
       }
-      const deadline = Date.now() + PROBE_DEADLINE_MS;
-      let winner = null;
-      let cursor = 0;
-      const probe = async () => {
-        while (!winner && Date.now() < deadline) {
-          const step = cursor;
-          cursor += 1;
-          if (step >= order.length) return;
-          const at = order[step];
-          const stream = list[at];
-          const target = playUrl(stream);
-          let ok;
-          if (stream.url) {
-            ok = await alive(target);
-          } else {
-            // The swarm first, the bytes second: stats is instant, a cold
-            // torrent is not.
-            const swarm = await swarmAlive(target);
-            ok = swarm === null ? await delivers(target, 32 * 1024, PROBE_MS) : swarm;
-          }
-          if (ok) {
-            if (!winner) winner = { at, target };
-            return;
-          }
-          console.log(`dead ${key} #${at} ${target.slice(0, 90)}`);
-        }
-      };
-      await Promise.all(Array.from({ length: Math.min(PROBES, order.length) }, probe));
-      if (winner) {
-        attempts.set(key, { index: winner.at + 1, at: Date.now() });
-        console.log(`play ${key} -> #${winner.at} ${winner.target.slice(0, 90)}`);
-        res.writeHead(302, { location: winner.target, 'access-control-allow-origin': '*' });
-        res.end();
-        return;
-      }
+      // No second opinion below this line: firstLive has already asked the
+      // engine which swarms are alive and which of those deliver. A slower
+      // fallback that hands over any candidate is what produced the spinner.
       attempts.set(key, { index: start + 1, at: Date.now() });
       res.writeHead(504, { 'content-type': 'text/plain' });
       res.end('no source answered');
