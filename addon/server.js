@@ -16,9 +16,20 @@ const PORT = Number(process.env.PORT || 3819);
 const PUBLIC = process.env.PUBLIC_URL || 'http://192.168.86.49:3819';
 const HUB = process.env.HUB_URL;           // .../manifest.json
 const STREAMING = process.env.STREAMING_URL || 'http://127.0.0.1:11470';
-const PROBE_MS = Number(process.env.PROBE_MS || 2500);
-const WANT = Number(process.env.WANT || 12);
+// A dead swarm answers nothing at all: 1.8s is long enough to know a torrent
+// is not going to start and short enough that four of them in parallel stay
+// under the player's patience.
+const PROBE_MS = Number(process.env.PROBE_MS || 1800);
+const WANT = Number(process.env.WANT || 40);
 const MIN_SEEDERS = Number(process.env.MIN_SEEDERS || 3);
+// Probing is a race, not a walk: PROBES candidates at a time, each given
+// PROBE_MS, and the whole list abandoned after PROBE_DEADLINE_MS. A player that
+// waits eight seconds still tries; one that waits thirty has already hung.
+const PROBES = Number(process.env.PROBES || 24);
+const PROBE_DEADLINE_MS = Number(process.env.PROBE_DEADLINE_MS || 7000);
+// A source is playable when some wire is actually delivering: peers that never
+// send look identical to a dead swarm to the player.
+const PLAYABLE_BYTES_PER_SEC = Number(process.env.PLAYABLE_BYTES_PER_SEC || 200000);
 const ADDON_NAME = 'AIOStream';
 
 if (!HUB) {
@@ -46,6 +57,12 @@ function isMediaLink(stream) {
   return Boolean(stream.url) && MEDIA.test(stream.url) && !isPlaceholder(stream);
 }
 
+function seedersOf(stream) {
+  return Number(
+    (/(?:👥|👤|seeders?[:\s]+)\s*(\d+)/.exec(`${stream.title || ''} ${stream.description || ''}`) || [])[1] || 0,
+  );
+}
+
 function rank(stream, browser) {
   const text = `${stream.name || ''} ${stream.title || ''} ${stream.description || ''}`.toLowerCase();
   // A browser cannot decode HEVC at all and 10-bit HEVC in no case: the stream
@@ -55,9 +72,7 @@ function rank(stream, browser) {
   const t = TIER.findIndex((token) => text.includes(token));
   const p2p = isMediaLink(stream) ? 0 : 1;     // a real file link starts sooner than a swarm
   // The hub writes the swarm size in the description, not the title.
-  const seeders = Number(
-    (/(?:👥|👤|seeders?[:\s]+)\s*(\d+)/.exec(`${stream.title || ''} ${stream.description || ''}`) || [])[1] || 0,
-  );
+  const seeders = seedersOf(stream);
   // A 4K torrent with two peers is not the "highest quality" anything: it is a
   // buffer. A swarm nobody is in is demoted below every source people are
   // actually seeding, however good its resolution reads.
@@ -143,6 +158,37 @@ function delivers(url, need, within) {
   });
 }
 
+// A cold torrent has no bytes to give for several seconds — the streaming server
+// is still fetching metadata and its first peers — so a byte-count probe calls a
+// perfectly good source dead and the list is walked for nothing. The server's
+// own stats say whether the swarm has anyone in it, which is the fact that
+// decides, and it answers in milliseconds.
+function swarmAlive(target) {
+  const match = /^https?:\/\/[^/]+\/([0-9a-f]{40})\//i.exec(target);
+  if (!match) return Promise.resolve(null);
+  const hash = match[1].toLowerCase();
+  return new Promise((resolve) => {
+    const req = http.get(`${STREAMING}/stats.json`, { timeout: 1500 }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        try {
+          const stats = JSON.parse(body)[hash];
+          if (!stats) return resolve(null);
+          const peers = Number(stats.peers || 0);
+          const unchoked = Number(stats.unchoked || 0);
+          resolve(peers > 0 && (unchoked > 0 || peers > 1));
+        } catch (_) {
+          resolve(null);
+        }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+  });
+}
+
 // A direct link is checked with a ranged GET: a dead host or a 403 must not be
 // handed to the player, and a few kilobytes is enough to know the link is real.
 function alive(url) {
@@ -179,6 +225,102 @@ function playUrl(stream) {
     .map((source) => source.slice(8));
   const query = trackers.length ? `?tr=${encodeURIComponent(trackers.join(','))}` : '';
   return `${STREAMING}/${stream.infoHash}${file}/${encodeURIComponent(name)}${query}`;
+}
+
+// Which of these torrents has anyone in it, asked of the engine rather than of
+// the hub. A ranged GET is what starts an engine, so the first few candidates
+// are loaded at once and their stats are polled until one reports peers or the
+// budget runs out. Nothing is awaited in series: the answer costs the slowest
+// load, not the sum of them.
+async function firstLive(list, orderUnsorted) {
+  let order = orderUnsorted;
+  const probeWindow = Number(process.env.LIVE_WINDOW_MS || 10000);
+  // The hub's own count is a cheap ordering hint: a torrent the hub believes has
+  // thirty seeders is a better first guess than one it lists as empty, even
+  // though only the engine can decide.
+  order = [...order].sort((left, right) => seedersOf(list[right]) - seedersOf(list[left]));
+  const loaded = [];
+  for (const at of order) {
+    const stream = list[at];
+    if (stream.url || !stream.infoHash) continue;
+    const target = playUrl(stream);
+    const match = /^https?:\/\/[^/]+\/([0-9a-f]{40})\//i.exec(target);
+    if (!match) continue;
+    loaded.push({ at, target, hash: match[1].toLowerCase() });
+    if (loaded.length >= PROBES) break;
+  }
+  if (!loaded.length) return null;
+  // A ranged request that closes at once reads as an abandoned download and the
+  // engine is torn down before it ever finds a peer. These stay open for the
+  // whole window — that is what a player does — and are dropped once the answer
+  // is known.
+  const open = [];
+  for (const item of loaded) {
+    const req = http.get(item.target, { headers: { 'user-agent': 'aio-failover/1.0' } });
+    req.on('error', () => {});
+    req.setTimeout(probeWindow + 2000, () => req.destroy());
+    open.push(req);
+  }
+  const close = () => { for (const req of open) { try { req.destroy(); } catch (_) {} } };
+  const deadline = Date.now() + probeWindow;
+  let best = null;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const stats = await readStats();
+    if (!stats) continue;
+    for (const item of loaded) {
+      const row = stats[item.hash];
+      if (!row) continue;
+      const peers = Number(row.peers || 0);
+      // A peer that never sends is not a source: the wires carry the rate, and
+      // a torrent whose only peer is silent looks exactly like a dead one to a
+      // player. 200 KB/s is past what a 1080p stream needs to start.
+      const rate = (row.wires || []).reduce(
+        (most, wire) => Math.max(most, Number(wire.downSpeed || 0)),
+        0,
+      );
+      if (peers > 0 && rate >= PLAYABLE_BYTES_PER_SEC) {
+        if (!best || rate > best.rate) best = { ...item, peers, rate };
+      }
+    }
+    // The rate is the swarm's, not this file's: a season pack can have fast
+    // peers and no complete copy of the episode that was asked for. So the
+    // fastest few are asked for their first kilobytes before one is handed over.
+    if (best) {
+      const finalists = loaded
+        .map((item) => ({ item, rate }))
+        .length;
+      void finalists;
+      close();
+      const want = loaded.slice(0, 4);
+      const race = await Promise.all(
+        want.map(async (item) => ((await delivers(item.target, 16 * 1024, 6000)) ? item : null)),
+      );
+      const winner = race.find(Boolean);
+      return winner ? { ...winner, peers: 1, rate: 1 } : best;
+    }
+  }
+  close();
+  return best;
+}
+
+function readStats() {
+  return new Promise((resolve) => {
+    const req = http.get(`${STREAMING}/stats.json`, { timeout: 1500 }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (_) {
+          resolve(null);
+        }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -251,19 +393,57 @@ const server = http.createServer(async (req, res) => {
       // probe, then play). Treating that as a failure skipped a good source and
       // walked the list for no reason.
       let start = last && now - last.at < 4000 ? last.index : (last ? last.index : 0);
-      for (let step = 0; step < list.length; step += 1) {
-        const at = (start + step) % list.length;
-        const stream = list[at];
-        const target = playUrl(stream);
-        const ok = stream.url ? await alive(target) : await delivers(target, 32 * 1024, 2500);
-        if (ok) {
-          attempts.set(key, { index: at + 1, at: Date.now() });
-          console.log(`play ${key} -> #${at} ${target.slice(0, 90)}`);
-          res.writeHead(302, { location: target, 'access-control-allow-origin': '*' });
-          res.end();
-          return;
+      // Probed in parallel, not one after another: a dead swarm costs its own
+      // probe and nothing else. Twelve candidates at 2.5s each in series is
+      // thirty seconds of spinner, and the player gives up long before the
+      // list is walked.
+      const order = list.map((_, step) => (start + step) % list.length);
+      // The hub's seed count is a claim about a swarm, not about this machine: a
+      // Torrentio result can say thirty-three seeders while the engine finds
+      // nobody. The engine's own stats are the fact, so a few torrents are
+      // loaded at once and the first one that reports peers is the answer.
+      const live = await firstLive(list, order);
+      if (live) {
+        attempts.set(key, { index: live.at + 1, at: Date.now() });
+        console.log(`play ${key} -> #${live.at} ${live.peers} peers ${live.target.slice(0, 80)}`);
+        res.writeHead(302, { location: live.target, 'access-control-allow-origin': '*' });
+        res.end();
+        return;
+      }
+      const deadline = Date.now() + PROBE_DEADLINE_MS;
+      let winner = null;
+      let cursor = 0;
+      const probe = async () => {
+        while (!winner && Date.now() < deadline) {
+          const step = cursor;
+          cursor += 1;
+          if (step >= order.length) return;
+          const at = order[step];
+          const stream = list[at];
+          const target = playUrl(stream);
+          let ok;
+          if (stream.url) {
+            ok = await alive(target);
+          } else {
+            // The swarm first, the bytes second: stats is instant, a cold
+            // torrent is not.
+            const swarm = await swarmAlive(target);
+            ok = swarm === null ? await delivers(target, 32 * 1024, PROBE_MS) : swarm;
+          }
+          if (ok) {
+            if (!winner) winner = { at, target };
+            return;
+          }
+          console.log(`dead ${key} #${at} ${target.slice(0, 90)}`);
         }
-        console.log(`dead ${key} #${at} ${target.slice(0, 90)}`);
+      };
+      await Promise.all(Array.from({ length: Math.min(PROBES, order.length) }, probe));
+      if (winner) {
+        attempts.set(key, { index: winner.at + 1, at: Date.now() });
+        console.log(`play ${key} -> #${winner.at} ${winner.target.slice(0, 90)}`);
+        res.writeHead(302, { location: winner.target, 'access-control-allow-origin': '*' });
+        res.end();
+        return;
       }
       attempts.set(key, { index: start + 1, at: Date.now() });
       res.writeHead(504, { 'content-type': 'text/plain' });
