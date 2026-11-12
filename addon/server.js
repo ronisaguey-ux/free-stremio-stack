@@ -29,7 +29,7 @@ const PROBES = Number(process.env.PROBES || 24);
 const PROBE_DEADLINE_MS = Number(process.env.PROBE_DEADLINE_MS || 7000);
 // A source is playable when some wire is actually delivering: peers that never
 // send look identical to a dead swarm to the player.
-const PLAYABLE_BYTES_PER_SEC = Number(process.env.PLAYABLE_BYTES_PER_SEC || 200000);
+const PLAYABLE_BYTES_PER_SEC = Number(process.env.PLAYABLE_BYTES_PER_SEC || 600000);
 const ADDON_NAME = 'AIOStream';
 
 if (!HUB) {
@@ -314,7 +314,14 @@ async function firstLive(list, orderUnsorted) {
         want.map(async (item) => ((await delivers(item.target, 16 * 1024, 6000)) ? item : null)),
       );
       const winner = race.find(Boolean);
-      return winner ? { ...winner, peers: 1, rate: 1 } : best;
+      // Report the winner's own swarm rate, not a placeholder: the log is how the
+      // next slow start gets diagnosed instead of guessed at.
+      if (winner) {
+        const row = (stats && stats[winner.hash]) || {};
+        const rate = (row.wires || []).reduce((most, wire) => Math.max(most, Number(wire.downSpeed || 0)), 0);
+        return { ...winner, peers: Number(row.peers || 0), rate };
+      }
+      return best;
     }
   }
   close();
@@ -422,8 +429,13 @@ const server = http.createServer(async (req, res) => {
       const live = await firstLive(list, order);
       if (live) {
         attempts.set(key, { index: live.at + 1, at: Date.now() });
-        console.log(`play ${key} -> #${live.at} ${live.peers} peers ${live.target.slice(0, 80)}`);
-        res.writeHead(302, { location: live.target, 'access-control-allow-origin': '*' });
+        // The player keys its resume position off the URL. The device was
+        // resuming 1.5 GB into an episode and waiting for a piece the swarm did
+        // not have, which is a spinner with no error. A fresh nonce makes each
+        // play a new stream, so it starts at zero.
+        const fresh = `${live.target}${live.target.includes('?') ? '&' : '?'}n=${Date.now()}`;
+        console.log(`play ${key} -> #${live.at} ${live.peers} peers ${Math.round(live.rate / 1024)} KB/s ${live.target.slice(0, 60)}`);
+        res.writeHead(302, { location: fresh, 'access-control-allow-origin': '*' });
         res.end();
         return;
       }
