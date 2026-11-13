@@ -421,7 +421,11 @@ const server = http.createServer(async (req, res) => {
 
     const streamMatch = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
     if (streamMatch) {
-      const [, type, id] = streamMatch;
+      // The panel percent-encodes the id once (`tt2193021%3A1%3A4`). Handing
+      // that to the hub un-decoded resolved a different episode — the panel
+      // played the premiere while the row said 1x4.
+      const type = streamMatch[1];
+      const id = decodeURIComponent(streamMatch[2]);
       const uaStream = String(req.headers['user-agent'] || '');
       const isBrowser = /Chrome|Mozilla|Safari|Firefox/i.test(uaStream);
       const list = await candidates(type, id, isBrowser);
@@ -449,32 +453,18 @@ const server = http.createServer(async (req, res) => {
       // host's streaming server instead — the swarm that was measured.
       const hash = top.infoHash || (/\/([0-9a-f]{40})\//i.exec(top.url || '') || [])[1];
       const engine = STREAMING.replace("127.0.0.1", new URL(PUBLIC).hostname);
-      const streams = native
-        ? [{
-            ...top,
-            name: ADDON_NAME,
-            title: label,
-            ...(hash ? { infoHash: undefined, url: `${engine}/${hash}/0` } : {}),
-            behaviorHints: { bingeGroup: 'aiostre-am', notWebReady: false },
-          }]
-        : [{
-            name: ADDON_NAME,
-            title: label,
-            url: `${PUBLIC}/play/${type}/${encodeURIComponent(id)}`,
-            behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
-          }];
-      // Warm the engine before the player asks for it: the first request for a
-      // torrent pays the swarm's start (seconds), every later one is instant.
-      // The panel asks for the row and the bytes in the same breath, so the
-      // head start is the difference between a splash screen and a picture.
-      if (hash) {
-        const warmReq = http.get(`${engine}/${hash}/0`, { headers: { range: 'bytes=0-65535', 'user-agent': 'aio-warm/1.0' } }, (body) => {
-          body.once('data', () => body.destroy());
-          body.on('error', () => {});
-        });
-        warmReq.setTimeout(20000, () => warmReq.destroy());
-        warmReq.on('error', () => {});
-      }
+      // Every torrent row points at this host's streaming engine, whatever the
+      // client calls itself. Wrapping it in /play meant the player's first
+      // request paid the probe, and every retry paid it again — a player that
+      // retries once a second never gets a picture. The engine is a plain HTTP
+      // video source, which both a browser and a native player understand.
+      const streams = [{
+        ...(hash ? {} : top),
+        name: ADDON_NAME,
+        title: label,
+        url: hash ? `${engine}/${hash}/0` : `${PUBLIC}/play/${type}/${id}`,
+        behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
+      }];
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
       res.end(JSON.stringify({ streams }));
       return;
