@@ -591,7 +591,17 @@ const server = http.createServer(async (req, res) => {
     const playMatch = path.match(/^\/play\/([^/]+)\/(.+)$/);
     if (playMatch) {
       const [, type, rawId] = playMatch;
-      const id = decodeURIComponent(rawId);
+      // The panel encodes the id once and some of its own requests encode the
+      // already-encoded path again (`tt2193021%253A1%253A3`). Decoding once left
+      // `%3A` in the id, the hub resolved a different episode, and the row said
+      // 1x3 while the premiere played. Decode until the string stops changing.
+      let id = rawId;
+      for (let pass = 0; pass < 3; pass += 1) {
+        let next = id;
+        try { next = decodeURIComponent(id); } catch (_) { break; }
+        if (next === id) break;
+        id = next;
+      }
       const key = `${type}:${id}`;
       const list = await candidates(type, id, true);
       if (!list.length) {
