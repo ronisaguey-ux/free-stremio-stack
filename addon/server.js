@@ -442,12 +442,20 @@ const server = http.createServer(async (req, res) => {
       // nothing to choose: Stremio cannot fall back because the addon gave it
       // no second entry. A native client gets five ranked sources instead, so a
       // torrent with no reachable peers is skipped by hand in one press.
+      // A native client plays a torrent through its OWN engine, on its own
+      // box: the TV's swarm is not this host's swarm, and a torrent this host
+      // has warm can be peerless from the TV, which is a splash screen that
+      // never ends. When the source is a torrent, the row points at this
+      // host's streaming server instead — the swarm that was measured.
+      const hash = top.infoHash || (/\/([0-9a-f]{40})\//i.exec(top.url || '') || [])[1];
+      const engine = STREAMING.replace("127.0.0.1", new URL(PUBLIC).hostname);
       const streams = native
         ? [{
             ...top,
             name: ADDON_NAME,
             title: label,
-            behaviorHints: { bingeGroup: 'aiostre-am' },
+            ...(hash ? { infoHash: undefined, url: `${engine}/${hash}/0` } : {}),
+            behaviorHints: { bingeGroup: 'aiostre-am', notWebReady: false },
           }]
         : [{
             name: ADDON_NAME,
@@ -455,6 +463,18 @@ const server = http.createServer(async (req, res) => {
             url: `${PUBLIC}/play/${type}/${encodeURIComponent(id)}`,
             behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
           }];
+      // Warm the engine before the player asks for it: the first request for a
+      // torrent pays the swarm's start (seconds), every later one is instant.
+      // The panel asks for the row and the bytes in the same breath, so the
+      // head start is the difference between a splash screen and a picture.
+      if (hash) {
+        const warmReq = http.get(`${engine}/${hash}/0`, { headers: { range: 'bytes=0-65535', 'user-agent': 'aio-warm/1.0' } }, (body) => {
+          body.once('data', () => body.destroy());
+          body.on('error', () => {});
+        });
+        warmReq.setTimeout(20000, () => warmReq.destroy());
+        warmReq.on('error', () => {});
+      }
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
       res.end(JSON.stringify({ streams }));
       return;
