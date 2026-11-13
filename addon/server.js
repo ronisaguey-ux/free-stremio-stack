@@ -43,6 +43,10 @@ const attempts = new Map(); // "type:id" -> how far down the list we have walked
 // twice: the winning stream is remembered, and the next play goes straight to it
 // while the torrent is still delivering.
 const warm = new Map(); // "type:id" -> { target, at }
+// The source the panel was last handed for a title, so a refresh does not pay
+// the probe again while the swarm is already warm.
+const streamChoice = new Map();
+const CHOICE_TTL_MS = Number(process.env.CHOICE_TTL_MS || 120000);
 const WARM_TTL_MS = Number(process.env.WARM_TTL_MS || 180000);
 
 const QUALITY = ['2160p', '1440p', '1080p', '720p', '576p', '480p', '360p'];
@@ -295,6 +299,62 @@ async function candidates(type, id, browser) {
   return (spoken.length ? spoken : streams).slice(0, WANT);
 }
 
+// English subtitle tracks for a title, from OpenSubtitles v3, matched to the
+// release when the hub handed us a filename. Failures are an empty list, never
+// an error: the player must not lose playback because subtitles are missing.
+const subtitleCache = new Map();
+
+async function subtitlesFor(type, id) {
+  const url = `https://opensubtitles-v3.strem.io/subtitles/${type}/${encodeURIComponent(id)}.json`;
+  let body = null;
+  try {
+    body = await get(url, Number(process.env.SUBS_TIMEOUT_MS || 8000));
+  } catch (_) {
+    body = null;
+  }
+  const rows = (body && body.subtitles) || [];
+  return rows
+    .filter((row) => /^(eng|en)$/i.test(String(row.lang || '')))
+    .filter((row) => row.url)
+    .slice(0, 20)
+    .map((row, index) => ({
+      ...row,
+      // The panel shows this text in the track list; without it every entry
+      // reads 'English' and nobody can tell the sync apart.
+      id: String(row.id || index),
+      lang: 'eng',
+      title: String(row.subtitleFileName || row.movieReleaseName || `English ${index + 1}`).slice(0, 70),
+    }));
+}
+
+// The engine only keeps a torrent loaded while something is asking for it: a
+// probe that closes the moment it has its verdict leaves the swarm cold again,
+// and the player's next request pays the entire cold start (16.8s measured on a
+// 45-peer WEB-DL). One held range request per title keeps it loaded in the
+// background, so the row the panel is showing is already warm when it is
+// pressed — and it is renewed before it expires.
+const held = new Map(); // hash -> { req, until }
+const WARM_HOLD_MS = Number(process.env.WARM_HOLD_MS || 90000);
+
+function keepWarm(hash) {
+  if (!hash) return;
+  const now = Date.now();
+  const prior = held.get(hash);
+  if (prior && prior.until > now) return;
+  if (prior) {
+    try { prior.req.destroy(); } catch (_) {}
+    held.delete(hash);
+  }
+  const req = http.get(`${STREAMING}/${hash}/0`, { headers: { Range: 'bytes=0-1048575' } }, (res) => {
+    res.on('data', () => {});
+    res.on('end', () => held.delete(hash));
+    res.on('error', () => held.delete(hash));
+  });
+  req.on('error', () => held.delete(hash));
+  req.setTimeout(WARM_HOLD_MS + 5000, () => { req.destroy(); held.delete(hash); });
+  held.set(hash, { req, until: now + WARM_HOLD_MS });
+}
+
 function playUrl(stream) {
   if (stream.url) return stream.url;
   const name = (stream.behaviorHints && stream.behaviorHints.filename) || '';
@@ -311,9 +371,9 @@ function playUrl(stream) {
 // are loaded at once and their stats are polled until one reports peers or the
 // budget runs out. Nothing is awaited in series: the answer costs the slowest
 // load, not the sum of them.
-async function firstLive(list, orderUnsorted) {
+async function firstLive(list, orderUnsorted, windowMs) {
   let order = orderUnsorted;
-  const probeWindow = Number(process.env.LIVE_WINDOW_MS || 20000);
+  const probeWindow = Number(windowMs || process.env.LIVE_WINDOW_MS || 20000);
   // The hub's own count is a cheap ordering hint: a torrent the hub believes has
   // thirty seeders is a better first guess than one it lists as empty, even
   // though only the engine can decide.
@@ -426,13 +486,32 @@ const server = http.createServer(async (req, res) => {
         version: '1.0.0',
         name: ADDON_NAME,
         description: 'One ranked source per title: the backend picks the one that answers.',
-        resources: ['stream'],
+        resources: ['stream', 'subtitles'],
         types: ['movie', 'series'],
         idPrefixes: ['tt'],
         catalogs: [],
       };
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
       res.end(JSON.stringify(manifest));
+      return;
+    }
+
+    // Subtitles are not a stream property: no source in the hub declares them,
+    // so the panel has nothing to show unless an addon supplies tracks. This
+    // addon supplies them itself — OpenSubtitles v3 is queried directly and
+    // only English comes back, so the list is short enough to be useful on a
+    // remote and every title has something to pick.
+    const subtitleMatch = path.match(/^\/subtitles\/([^/]+)\/(.+)\.json$/);
+    if (subtitleMatch) {
+      const subType = subtitleMatch[1];
+      const subId = decodeURIComponent(subtitleMatch[2]);
+      let tracks = subtitleCache.get(`${subType}:${subId}`);
+      if (!tracks || Date.now() > tracks.expires) {
+        tracks = { rows: await subtitlesFor(subType, subId), expires: Date.now() + 10 * 60 * 1000 };
+        subtitleCache.set(`${subType}:${subId}`, tracks);
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      res.end(JSON.stringify({ subtitles: tracks.rows }));
       return;
     }
 
@@ -451,7 +530,23 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ streams: [] }));
         return;
       }
-      const top = list[0];
+      // The single row must be a source that is delivering: the hub's order is
+      // a claim about swarms, and a claim is not a fact. Probing here costs a
+      // few seconds once and removes the whole class of 'it spins forever'.
+      const cacheKey = `${type}:${id}`;
+      const cached = streamChoice.get(cacheKey);
+      let live = null;
+      if (cached && Date.now() - cached.at < CHOICE_TTL_MS) {
+        live = list.find((row) => (row.infoHash || '') === cached.hash) ? cached : null;
+      }
+      if (!live) {
+        const probed = await firstLive(list, list.map((_, step) => step), Number(process.env.STREAM_PROBE_MS || 6000)).catch(() => null);
+        if (probed) {
+          live = { at: probed.at, hash: probed.hash, peers: probed.peers, rate: probed.rate, at_ms: Date.now() };
+          streamChoice.set(cacheKey, { ...live, at: Date.now() });
+        }
+      }
+      const top = live && list[live.at] ? list[live.at] : list[0];
       const label = `${ADDON_NAME} · ${(top.name || '').replace(/^\[[^\]]*\]\s*/, '').slice(0, 28)}`;
       // A native client has its own torrent engine and plays peer to peer far
       // better than a LAN hop through this host's streaming server. A browser
@@ -468,7 +563,7 @@ const server = http.createServer(async (req, res) => {
       // has warm can be peerless from the TV, which is a splash screen that
       // never ends. When the source is a torrent, the row points at this
       // host's streaming server instead — the swarm that was measured.
-      const hash = top.infoHash || (/\/([0-9a-f]{40})\//i.exec(top.url || '') || [])[1];
+      const hash = (live && live.hash) || top.infoHash || (/\/([0-9a-f]{40})\//i.exec(top.url || '') || [])[1];
       const engine = STREAMING.replace("127.0.0.1", new URL(PUBLIC).hostname);
       // Every torrent row points at this host's streaming engine, whatever the
       // client calls itself. Wrapping it in /play meant the player's first
@@ -482,6 +577,10 @@ const server = http.createServer(async (req, res) => {
         url: hash ? `${engine}/${hash}/0` : `${PUBLIC}/play/${type}/${id}`,
         behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
       }];
+      // Warm before answering: the panel fetches /stream once and then shows
+      // the row, which gives the engine the few seconds it needs to load the
+      // swarm. The player's own request then finds it ready.
+      if (hash) keepWarm(hash);
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
       res.end(JSON.stringify({ streams }));
       return;
