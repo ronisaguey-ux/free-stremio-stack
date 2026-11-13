@@ -68,6 +68,25 @@ function seedersOf(stream) {
   );
 }
 
+// A release that says ITA, FRE, GER and nothing else is not an English watch,
+// and the panel cannot tell until the volume is up and nobody is speaking it.
+// A language line the hub prints is authoritative; otherwise the release name
+// is read for a foreign tag that stands alone, with no English or multi beside
+// it. Ambiguous names are kept: dropping what cannot be read would empty the
+// list.
+const FOREIGN_TAG = /(?:^|[.\s_(\\/\-])(ita|fre|vff|vf|ger|deu|spa|esp|rus|hin|tam|tel|jpn|jap|kor|chi|zho|pol|tur|swe|nor|dan|dut|nld|por|pob|cze|hun|rom|gre|ukr|ara|heb|tha|vie|may|ind)(?=[.\s_)\\/\-]|$)/i;
+const ENGLISH_TAG = /(?:^|[.\s_(\\/\-])(eng|english|multi|dual)(?=[.\s_)\\/\-]|$)|🌎[^\n]{0,40}English/i;
+
+function englishOnly(stream) {
+  const text = `${stream.name || ''} ${stream.title || ''} ${stream.description || ''} ${
+    (stream.behaviorHints && stream.behaviorHints.filename) || ''
+  }`;
+  const line = /🌎([^\n📁]*)📝?/.exec(text);
+  if (line) return /English|Multi/i.test(line[1]);
+  if (ENGLISH_TAG.test(text)) return true;
+  return !FOREIGN_TAG.test(text);
+}
+
 function rank(stream, browser) {
   const text = `${stream.name || ''} ${stream.title || ''} ${stream.description || ''}`.toLowerCase();
   // A browser cannot decode HEVC at all and 10-bit HEVC in no case: the stream
@@ -82,7 +101,14 @@ function rank(stream, browser) {
   // buffer. A swarm nobody is in is demoted below every source people are
   // actually seeding, however good its resolution reads.
   const lonely = stream.infoHash && seeders < MIN_SEEDERS ? 1 : 0;
-  return [lonely, heavy ? 1 : 0, q === -1 ? 99 : q, t === -1 ? 99 : t, p2p, -seeders];
+  // Fire TV cannot decode TrueHD, Atmos or DTS-HD: the picture plays and the
+  // sound is silent with the volume at maximum. That is a worse outcome than a
+  // lower resolution, so the audio codec is ranked above quality: a 1080p AC3
+  // source beats a 4K TrueHD one. A description that names both is fine — the
+  // clear token wins — so `mute` only fires when nothing decodable is listed.
+  const clear = /(e-?ac-?3|eac3|ddp|dd\+|ac-?3|aac|opus|mp3)/i.test(text);
+  const mute = !clear && /(truehd|atmos|dts[- ]?hd|dts[- ]?x|\bdts\b|flac|pcm)/i.test(text);
+  return [lonely, mute ? 1 : 0, clear ? 0 : 1, heavy ? 1 : 0, q === -1 ? 99 : q, t === -1 ? 99 : t, p2p, -seeders];
 }
 
 function better(a, b) {
@@ -212,7 +238,24 @@ function alive(url) {
 }
 
 async function candidates(type, id, browser) {
-  const body = await get(`${HUB_BASE}/stream/${type}/${id}.json`, 15000);
+  let body;
+  try {
+    body = await get(`${HUB_BASE}/stream/${type}/${id}.json`, 15000);
+  } catch (_) {
+    body = null;
+  }
+  // The hub answers 324 streams for a title and then, under load, nothing at
+  // all: one failed fetch showed the player "no streams found" for every
+  // title until the next request. One retry costs 350 ms and removes a class
+  // of empty answers that reads as a broken addon.
+  if (!body || !(body.streams || []).length) {
+    await new Promise((r) => setTimeout(r, 350));
+    try {
+      const again = await get(`${HUB_BASE}/stream/${type}/${id}.json`, 15000);
+      if (again && (again.streams || []).length) body = again;
+    } catch (_) {}
+  }
+  body = body || {};
   const EPISODE = /\bS\d{1,2}E\d{1,3}\b|\b\d{1,2}x\d{1,2}\b|\bSeason[ ._-]?\d{1,2}\b/i;
   const streams = (body.streams || [])
     .filter((stream) => stream.url || stream.infoHash)
@@ -231,7 +274,8 @@ async function candidates(type, id, browser) {
     .sort((left, right) => Number(left.episode) - Number(right.episode))
     .map((stream) => ({ ...stream, browser }));
   streams.sort(better);
-  return streams.slice(0, WANT);
+  const spoken = streams.filter(englishOnly);
+  return (spoken.length ? spoken : streams).slice(0, WANT);
 }
 
 function playUrl(stream) {
@@ -355,6 +399,8 @@ function readStats() {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, PUBLIC);
   const path = url.pathname;
+  // One line per request: the only way to see whether the TV reached this box.
+  console.log(`${new Date().toISOString()} ${req.socket.remoteAddress} ${req.headers['user-agent'] || '-'} ${path}`);
 
   try {
     if (path === '/manifest.json') {
@@ -362,7 +408,7 @@ const server = http.createServer(async (req, res) => {
         id: 'org.aiostre.am',
         version: '1.0.0',
         name: ADDON_NAME,
-        description: 'One stream per title: the best source that answers, with a fallback list behind it.',
+        description: 'One ranked source per title: the backend picks the one that answers.',
         resources: ['stream'],
         types: ['movie', 'series'],
         idPrefixes: ['tt'],
@@ -392,9 +438,18 @@ const server = http.createServer(async (req, res) => {
       // Stremio addon is given about who is asking.
       const ua = String(req.headers['user-agent'] || '');
       const native = /Stremio/i.test(ua) && !/Chrome|Mozilla|Safari/i.test(ua);
-      const streams = [native
-        ? { ...top, name: ADDON_NAME, title: label, behaviorHints: { bingeGroup: 'aiostre-am' } }
-        : {
+      // One row is one dead swarm away from a player that spins forever with
+      // nothing to choose: Stremio cannot fall back because the addon gave it
+      // no second entry. A native client gets five ranked sources instead, so a
+      // torrent with no reachable peers is skipped by hand in one press.
+      const streams = native
+        ? [{
+            ...top,
+            name: ADDON_NAME,
+            title: label,
+            behaviorHints: { bingeGroup: 'aiostre-am' },
+          }]
+        : [{
             name: ADDON_NAME,
             title: label,
             url: `${PUBLIC}/play/${type}/${encodeURIComponent(id)}`,
