@@ -409,6 +409,55 @@ async function fileIndexFor(hash, id) {
   return best;
 }
 
+// The player loads a subtitle by URL and, after a seek, asks that same URL for
+// the whole track again. Handing it OpenSubtitles' download link means a
+// redirect chain and a raw SRT with a BOM: the two things that make a player
+// keep the old timing after a jump. The addon serves the track itself as WebVTT
+// from one stable URL, so a seek re-reads a file that starts with WEBVTT.
+const vttCache = new Map(); // token -> { body, expires }
+const VTT_TTL_MS = 30 * 60 * 1000;
+
+function vttToken(url) {
+  return Buffer.from(url).toString('base64url');
+}
+
+function srtToVtt(text) {
+  const cleaned = String(text || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/^(\d+)\n(\d{2}:\d{2}:\d{2}),(\d{3}) --> /gm, '$2.$3 --> ')
+    .replace(/,([0-9]{3})/g, '.$1');
+  return `WEBVTT\n\n${cleaned.trim()}\n`;
+}
+
+async function vttBody(token) {
+  const known = vttCache.get(token);
+  if (known && Date.now() < known.expires) return known.body;
+  const url = Buffer.from(token, 'base64url').toString('utf8');
+  if (!/^https?:\/\//.test(url)) return null;
+  const body = await new Promise((resolve) => {
+    const target = new URL(url);
+    const lib = target.protocol === 'https:' ? https : http;
+    const req = lib.get(url, { headers: { 'user-agent': 'aio-failover/1.0' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        resolve(null);
+        return;
+      }
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { text += chunk; });
+      res.on('end', () => resolve(text));
+    });
+    req.setTimeout(15000, () => req.destroy());
+    req.on('error', () => resolve(null));
+  });
+  if (!body) return null;
+  const vtt = srtToVtt(body);
+  vttCache.set(token, { body: vtt, expires: Date.now() + VTT_TTL_MS });
+  return vtt;
+}
+
 async function subtitlesFor(type, id, release) {
   const url = `https://opensubtitles-v3.strem.io/subtitles/${type}/${encodeURIComponent(id)}.json`;
   let body = null;
@@ -433,6 +482,8 @@ async function subtitlesFor(type, id, release) {
       id: String(row.id || index),
       lang: 'eng',
       title: String(row.subtitleFileName || row.movieReleaseName || `English ${index + 1}`).slice(0, 70),
+      // Served by this addon, converted to VTT, one stable URL per track.
+      url: `${PUBLIC}/vtt/${vttToken(row.url)}.vtt`,
     }));
 }
 
@@ -620,6 +671,23 @@ const server = http.createServer(async (req, res) => {
     // addon supplies them itself — OpenSubtitles v3 is queried directly and
     // only English comes back, so the list is short enough to be useful on a
     // remote and every title has something to pick.
+    const vttMatch = path.match(/^\/vtt\/([A-Za-z0-9_-]+)\.vtt$/);
+    if (vttMatch) {
+      const body = await vttBody(vttMatch[1]);
+      if (!body) {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('subtitle unavailable');
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': 'text/vtt; charset=utf-8',
+        'cache-control': 'public, max-age=1800',
+        'access-control-allow-origin': '*',
+      });
+      res.end(body);
+      return;
+    }
+
     const subtitleMatch = path.match(/^\/subtitles\/([^/]+)\/(.+)\.json$/);
     if (subtitleMatch) {
       const subType = subtitleMatch[1];
