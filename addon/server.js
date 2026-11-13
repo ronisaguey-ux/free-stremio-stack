@@ -483,7 +483,9 @@ const server = http.createServer(async (req, res) => {
     if (path === '/manifest.json') {
       const manifest = {
         id: 'org.aiostre.am',
-        version: '1.0.0',
+        // Bumped when resources change: the panel caches a manifest by version,
+        // and a stale cache is an addon that silently has no subtitles.
+        version: '1.1.0',
         name: ADDON_NAME,
         description: 'One ranked source per title: the backend picks the one that answers.',
         resources: ['stream', 'subtitles'],
