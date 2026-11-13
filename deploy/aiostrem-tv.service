@@ -1,0 +1,12 @@
+[Unit]
+Description=AIOStream addon tunnel and Fire TV addon install
+After=network-online.target aiostrem.service
+
+[Service]
+Type=simple
+ExecStart=/home/roni-saguey/.local/bin/aiostrem-tv.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
