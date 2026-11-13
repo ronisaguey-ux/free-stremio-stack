@@ -1,0 +1,12 @@
+[Unit]
+Description=Restores mastercrust's addon and its address when it comes back
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/roni-saguey/.local/bin/aiostrem-heal.sh
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
