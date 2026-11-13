@@ -106,9 +106,26 @@ function rank(stream, browser) {
   // lower resolution, so the audio codec is ranked above quality: a 1080p AC3
   // source beats a 4K TrueHD one. A description that names both is fine — the
   // clear token wins — so `mute` only fires when nothing decodable is listed.
+  // A BluRay REMUX at six to sixty gigabytes carries TrueHD or DTS-HD almost
+  // without exception, and the panel has no codec field to say so: the picture
+  // plays and the sound is silent with the volume at maximum. Size is the only
+  // signal a remux leaves, so it queues behind every ordinary encode.
+  const remux = /\bremux\b/i.test(text) ? 1 : 0;
+  const gb = Number((/([\d.]+)\s*GB/i.exec(text) || [])[1] || 0);
+  const heavyFile = gb >= 4 ? 1 : 0;
   const clear = /(e-?ac-?3|eac3|ddp|dd\+|ac-?3|aac|opus|mp3)/i.test(text);
   const mute = !clear && /(truehd|atmos|dts[- ]?hd|dts[- ]?x|\bdts\b|flac|pcm)/i.test(text);
-  return [lonely, mute ? 1 : 0, clear ? 0 : 1, heavy ? 1 : 0, q === -1 ? 99 : q, t === -1 ? 99 : t, p2p, -seeders];
+  return [
+    lonely,
+    remux || heavyFile,
+    mute ? 1 : 0,
+    clear ? 0 : 1,
+    heavy ? 1 : 0,
+    q === -1 ? 99 : q,
+    t === -1 ? 99 : t,
+    p2p,
+    -seeders,
+  ];
 }
 
 function better(a, b) {
