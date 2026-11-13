@@ -371,8 +371,12 @@ function playUrl(stream) {
 // are loaded at once and their stats are polled until one reports peers or the
 // budget runs out. Nothing is awaited in series: the answer costs the slowest
 // load, not the sum of them.
-async function firstLive(list, orderUnsorted, windowMs) {
+async function firstLive(list, orderUnsorted, windowMs, maxProbes) {
   let order = orderUnsorted;
+  // How many candidates this call is allowed to load. Every probe leaves a
+  // torrent loaded on the engine, so a stream request that probes the whole
+  // list leaves forty swarms spinning for one chosen source.
+  const probeCap = Number(maxProbes || PROBES);
   const probeWindow = Number(windowMs || process.env.LIVE_WINDOW_MS || 20000);
   // The hub's own count is a cheap ordering hint: a torrent the hub believes has
   // thirty seeders is a better first guess than one it lists as empty, even
@@ -386,7 +390,7 @@ async function firstLive(list, orderUnsorted, windowMs) {
     const match = /^https?:\/\/[^/]+\/([0-9a-f]{40})\//i.exec(target);
     if (!match) continue;
     loaded.push({ at, target, hash: match[1].toLowerCase() });
-    if (loaded.length >= PROBES) break;
+    if (loaded.length >= probeCap) break;
   }
   if (!loaded.length) return null;
   // A ranged request that closes at once reads as an abandoned download and the
@@ -542,7 +546,7 @@ const server = http.createServer(async (req, res) => {
         live = list.find((row) => (row.infoHash || '') === cached.hash) ? cached : null;
       }
       if (!live) {
-        const probed = await firstLive(list, list.map((_, step) => step), Number(process.env.STREAM_PROBE_MS || 6000)).catch(() => null);
+        const probed = await firstLive(list, list.map((_, step) => step), Number(process.env.STREAM_PROBE_MS || 6000), Number(process.env.STREAM_PROBES || 8)).catch(() => null);
         if (probed) {
           live = { at: probed.at, hash: probed.hash, peers: probed.peers, rate: probed.rate, at_ms: Date.now() };
           streamChoice.set(cacheKey, { ...live, at: Date.now() });
