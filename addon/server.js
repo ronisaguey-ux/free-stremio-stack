@@ -445,23 +445,27 @@ async function subtitlesFor(type, id, release) {
 const held = new Map(); // hash -> { req, until }
 const WARM_HOLD_MS = Number(process.env.WARM_HOLD_MS || 90000);
 
-function keepWarm(hash) {
+function keepWarm(hash, fileAt) {
   if (!hash) return;
+  const index = Number(fileAt || 0);
+  const key = `${hash}:${index}`;
   const now = Date.now();
-  const prior = held.get(hash);
+  const prior = held.get(key);
   if (prior && prior.until > now) return;
   if (prior) {
     try { prior.req.destroy(); } catch (_) {}
-    held.delete(hash);
+    held.delete(key);
   }
-  const req = http.get(`${STREAMING}/${hash}/0`, { headers: { Range: 'bytes=0-1048575' } }, (res) => {
+  // Warm the file the panel is about to ask for: warming file 0 of a season
+  // pack warms the pilot, which is the wrong episode at 200 MB a minute.
+  const req = http.get(`${STREAMING}/${hash}/${index}`, { headers: { Range: 'bytes=0-1048575' } }, (res) => {
     res.on('data', () => {});
-    res.on('end', () => held.delete(hash));
-    res.on('error', () => held.delete(hash));
+    res.on('end', () => held.delete(key));
+    res.on('error', () => held.delete(key));
   });
-  req.on('error', () => held.delete(hash));
-  req.setTimeout(WARM_HOLD_MS + 5000, () => { req.destroy(); held.delete(hash); });
-  held.set(hash, { req, until: now + WARM_HOLD_MS });
+  req.on('error', () => held.delete(key));
+  req.setTimeout(WARM_HOLD_MS + 5000, () => { req.destroy(); held.delete(key); });
+  held.set(key, { req, until: now + WARM_HOLD_MS });
 }
 
 function playUrl(stream) {
@@ -709,7 +713,7 @@ const server = http.createServer(async (req, res) => {
       // Warm before answering: the panel fetches /stream once and then shows
       // the row, which gives the engine the few seconds it needs to load the
       // swarm. The player's own request then finds it ready.
-      if (hash) keepWarm(hash);
+      if (hash) keepWarm(hash, fileAt);
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
       res.end(jsonSafe({ streams }));
       return;
