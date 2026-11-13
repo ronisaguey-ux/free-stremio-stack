@@ -354,6 +354,61 @@ function releaseScore(subtitle, release) {
   return score;
 }
 
+// A season pack is one torrent with every episode inside it. `/0` is the first
+// file in the pack, not the episode the panel asked for: pointing the player at
+// file zero played episode one under an episode three title, and nothing in the
+// URL said so. The engine already knows the file list, so the index is resolved
+// from the name the panel's own id implies.
+const fileLists = new Map(); // hash -> { files, at }
+
+async function filesFor(hash) {
+  const known = fileLists.get(hash);
+  if (known && Date.now() - known.at < 10 * 60 * 1000) return known.files;
+  try {
+    const stats = await get(`http://127.0.0.1:11470/stats.json`, 4000);
+    const entry = stats && stats[hash.toLowerCase().slice(0, 40)];
+    const files = (entry && entry.files) || [];
+    if (files.length) {
+      fileLists.set(hash, { files, at: Date.now() });
+      return files;
+    }
+  } catch (_) {}
+  return [];
+}
+
+const VIDEO = /\.(mkv|mp4|avi|m4v|mov|webm|ts)$/i;
+
+/** The file index inside a torrent that holds the episode (or film) asked for. */
+async function fileIndexFor(hash, id) {
+  const files = await filesFor(hash);
+  if (!files.length) return 0;
+  const series = /:(\d+):(\d+)$/.exec(String(id || ''));
+  if (series) {
+    const season = Number(series[1]);
+    const episode = Number(series[2]);
+    const wanted = [
+      new RegExp(`S0*${season}E0*${episode}\\b`, 'i'),
+      new RegExp(`\\b${season}x0*${episode}\\b`, 'i'),
+    ];
+    const at = files.findIndex((file) => wanted.some((pattern) => pattern.test(String(file.name || ''))));
+    if (at >= 0) return at;
+    return 0;
+  }
+  // A film: the pack is a sample beside the feature, so take the biggest video.
+  let best = 0;
+  let longest = -1;
+  files.forEach((file, index) => {
+    const name = String(file.name || '');
+    if (!VIDEO.test(name)) return;
+    const length = Number(file.length || 0);
+    if (length > longest) {
+      longest = length;
+      best = index;
+    }
+  });
+  return best;
+}
+
 async function subtitlesFor(type, id, release) {
   const url = `https://opensubtitles-v3.strem.io/subtitles/${type}/${encodeURIComponent(id)}.json`;
   let body = null;
@@ -638,6 +693,7 @@ const server = http.createServer(async (req, res) => {
       // host's streaming server instead — the swarm that was measured.
       const hash = (live && live.hash) || top.infoHash || (/\/([0-9a-f]{40})\//i.exec(top.url || '') || [])[1];
       const engine = STREAMING.replace("127.0.0.1", new URL(PUBLIC).hostname);
+      const fileAt = hash ? await fileIndexFor(hash, id) : 0;
       // Every torrent row points at this host's streaming engine, whatever the
       // client calls itself. Wrapping it in /play meant the player's first
       // request paid the probe, and every retry paid it again — a player that
@@ -647,7 +703,7 @@ const server = http.createServer(async (req, res) => {
         ...(hash ? {} : top),
         name: ADDON_NAME,
         title: label,
-        url: hash ? `${engine}/${hash}/0` : `${PUBLIC}/play/${type}/${id}`,
+        url: hash ? `${engine}/${hash}/${fileAt}` : `${PUBLIC}/play/${type}/${id}`,
         behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
       }];
       // Warm before answering: the panel fetches /stream once and then shows
