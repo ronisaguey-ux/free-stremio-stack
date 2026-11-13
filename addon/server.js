@@ -304,19 +304,73 @@ async function candidates(type, id, browser) {
 // an error: the player must not lose playback because subtitles are missing.
 const subtitleCache = new Map();
 
-async function subtitlesFor(type, id) {
+// Stremio's client rejects a payload with "Invalid type null" when a field it
+// expects to be a string arrives as null, and the hub's rows are full of them:
+// `url: null` on a torrent row, `title: null` on an untitled rip. The addon's
+// own contract is "every field is either absent or the right type", so the
+// serializer drops nulls instead of forwarding them.
+function jsonSafe(value) {
+  return JSON.stringify(value, (_key, item) => (item === null ? undefined : item));
+}
+
+// Subtitles are only in sync with the release they were timed against. The
+// panel plays the torrent this addon chose and then asks for subtitles by title
+// id alone, so OpenSubtitles answers with whatever it likes — an HDTV rip's
+// track under a BluRay source drifts by minutes, which is what a ten minute
+// offset looks like. Reading the release we actually handed the player and
+// ranking the tracks against it is the whole fix: the first track in the list
+// is the one the player auto-selects.
+const RELEASE_TAGS = /\b(2160p|1080p|720p|480p|web-?dl|web-?rip|bluray|blu-ray|brrip|bdrip|hdtv|dvdrip|dvdscr|remux|hdr|x264|x265|h264|hevc|av1)\b/gi;
+const RELEASE_NOISE = /\b(eng|english|subs?|subtitle|srt|ass|multi|complete|season|episode)\b/gi;
+
+function releaseTokens(text) {
+  const tokens = new Set();
+  const words = String(text || '')
+    .replace(/[._\[\]()]/g, ' ')
+    .replace(RELEASE_TAGS, (tag) => ` ${tag.toLowerCase()} `)
+    .replace(RELEASE_NOISE, ' ')
+    .split(/\s+/);
+  for (const word of words) {
+    const clean = word.replace(/[^A-Za-z0-9]/g, '').toLowerCase();
+    if (clean.length >= 3) tokens.add(clean);
+  }
+  return tokens;
+}
+
+/** How well a subtitle's release name fits the torrent we chose. */
+function releaseScore(subtitle, release) {
+  if (!release) return 0;
+  const wanted = releaseTokens(release);
+  if (!wanted.size) return 0;
+  const found = releaseTokens(`${subtitle.movieReleaseName || ''} ${subtitle.subtitleFileName || ''}`);
+  let score = 0;
+  for (const token of found) if (wanted.has(token)) score += 1;
+  // The source tag is the part that decides timing: HDTV against BluRay is the
+  // ten minute drift, while a matching encode is a second at most.
+  for (const tag of ['hdtv', 'bluray', 'webdl', 'webrip', 'dvdrip', 'remux']) {
+    if (found.has(tag) && wanted.has(tag)) score += 4;
+    else if (found.has(tag) && !wanted.has(tag)) score -= 2;
+  }
+  return score;
+}
+
+async function subtitlesFor(type, id, release) {
   const url = `https://opensubtitles-v3.strem.io/subtitles/${type}/${encodeURIComponent(id)}.json`;
   let body = null;
   try {
     body = await get(url, Number(process.env.SUBS_TIMEOUT_MS || 8000));
-  } catch (_) {
+  } catch (err) {
     body = null;
   }
   const rows = (body && body.subtitles) || [];
-  return rows
+  const english = rows
     .filter((row) => /^(eng|en)$/i.test(String(row.lang || '')))
     .filter((row) => row.url)
+    .map((row, index) => ({ row, index, score: releaseScore(row, release) }))
+    .sort((a, b) => (b.score - a.score) || (a.index - b.index))
     .slice(0, 20)
+    .map(({ row }) => row);
+  return english
     .map((row, index) => ({
       ...row,
       // The panel shows this text in the track list; without it every entry
@@ -498,7 +552,7 @@ const server = http.createServer(async (req, res) => {
         catalogs: [],
       };
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-      res.end(JSON.stringify(manifest));
+      res.end(jsonSafe(manifest));
       return;
     }
 
@@ -511,13 +565,16 @@ const server = http.createServer(async (req, res) => {
     if (subtitleMatch) {
       const subType = subtitleMatch[1];
       const subId = decodeURIComponent(subtitleMatch[2]);
-      let tracks = subtitleCache.get(`${subType}:${subId}`);
+      const picked = streamChoice.get(`${subType}:${subId}`);
+      const release = picked ? [picked.releaseName, picked.releaseTitle].filter(Boolean).join(' ') : '';
+      const cacheKey = `${subType}:${subId}:${release}`;
+      let tracks = subtitleCache.get(cacheKey);
       if (!tracks || Date.now() > tracks.expires) {
-        tracks = { rows: await subtitlesFor(subType, subId), expires: Date.now() + 10 * 60 * 1000 };
-        subtitleCache.set(`${subType}:${subId}`, tracks);
+        tracks = { rows: await subtitlesFor(subType, subId, release), expires: Date.now() + 10 * 60 * 1000 };
+        subtitleCache.set(cacheKey, tracks);
       }
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-      res.end(JSON.stringify({ subtitles: tracks.rows }));
+      res.end(jsonSafe({ subtitles: tracks.rows }));
       return;
     }
 
@@ -533,7 +590,7 @@ const server = http.createServer(async (req, res) => {
       const list = await candidates(type, id, isBrowser);
       if (!list.length) {
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-        res.end(JSON.stringify({ streams: [] }));
+        res.end(jsonSafe({ streams: [] }));
         return;
       }
       // The single row must be a source that is delivering: the hub's order is
@@ -554,6 +611,16 @@ const server = http.createServer(async (req, res) => {
       }
       const top = live && list[live.at] ? list[live.at] : list[0];
       const label = `${ADDON_NAME} · ${(top.name || '').replace(/^\[[^\]]*\]\s*/, '').slice(0, 28)}`;
+      // Remember what release was handed to the player: the subtitle request
+      // arrives by title id alone, and this is the only thing that can tell a
+      // matching track from a foreign one.
+      streamChoice.set(cacheKey, {
+        ...(streamChoice.get(cacheKey) || { at: Date.now() }),
+        releaseName: String(top.name || ''),
+        releaseTitle: [top.title, top.description, (top.behaviorHints && top.behaviorHints.filename)]
+          .filter(Boolean)
+          .join(' '),
+      });
       // A native client has its own torrent engine and plays peer to peer far
       // better than a LAN hop through this host's streaming server. A browser
       // has none, so it gets the redirect. The user agent is the only signal a
@@ -588,7 +655,7 @@ const server = http.createServer(async (req, res) => {
       // swarm. The player's own request then finds it ready.
       if (hash) keepWarm(hash);
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-      res.end(JSON.stringify({ streams }));
+      res.end(jsonSafe({ streams }));
       return;
     }
 
