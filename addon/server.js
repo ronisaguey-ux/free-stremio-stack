@@ -10,12 +10,14 @@
 
 const http = require('http');
 const https = require('https');
+const os = require('os');
 const { URL } = require('url');
 
 const PORT = Number(process.env.PORT || 3819);
 const PUBLIC = process.env.PUBLIC_URL || 'http://192.168.86.49:3819';
-const HUB = process.env.HUB_URL;           // .../manifest.json
-const STREAMING = process.env.STREAMING_URL || 'http://127.0.0.1:11470';
+const HUB = process.env.HUB_URL || '';           // .../manifest.json
+const STREAMING = (process.env.STREAMING_URL || 'http://127.0.0.1:11470').replace(/\/$/, '');
+const STREAMING_PUBLIC = (process.env.STREAMING_PUBLIC_URL || '').replace(/\/$/, '');
 // A dead swarm answers nothing at all: 1.8s is long enough to know a torrent
 // is not going to start and short enough that four of them in parallel stay
 // under the player's patience.
@@ -32,11 +34,67 @@ const PROBE_DEADLINE_MS = Number(process.env.PROBE_DEADLINE_MS || 7000);
 const PLAYABLE_BYTES_PER_SEC = Number(process.env.PLAYABLE_BYTES_PER_SEC || 600000);
 const ADDON_NAME = 'AIOStream';
 
-if (!HUB) {
+if (require.main === module && !HUB) {
   console.error('HUB_URL is required (the AIOStreams manifest URL)');
   process.exit(1);
 }
 const HUB_BASE = HUB.replace(/\/manifest\.json$/, '');
+
+function decodeId(raw) {
+  let id = String(raw || '');
+  for (let pass = 0; pass < 3; pass += 1) {
+    let next = id;
+    try { next = decodeURIComponent(id); } catch (_) { break; }
+    if (next === id) break;
+    id = next;
+  }
+  return id;
+}
+
+function isLoopbackHost(host) {
+  const h = String(host || '').toLowerCase();
+  return !h || h === '127.0.0.1' || h === 'localhost' || h === '::1';
+}
+
+function isPrivateLanHost(host) {
+  return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(String(host || ''));
+}
+
+function detectLanIp() {
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const info of ifaces || []) {
+      if (info && info.family === 'IPv4' && !info.internal) return info.address;
+    }
+  }
+  return '';
+}
+
+function resolveEngineBase(streamingUrl = STREAMING, publicUrl = PUBLIC, explicitPublic = STREAMING_PUBLIC) {
+  if (explicitPublic) return explicitPublic.replace(/\/$/, '');
+  const u = new URL(streamingUrl);
+  if (!isLoopbackHost(u.hostname)) return streamingUrl.replace(/\/$/, '');
+  const pubHost = new URL(publicUrl).hostname;
+  if (isPrivateLanHost(pubHost)) {
+    u.hostname = pubHost;
+    return u.toString().replace(/\/$/, '');
+  }
+  const lanIp = detectLanIp();
+  if (lanIp) {
+    u.hostname = lanIp;
+    return u.toString().replace(/\/$/, '');
+  }
+  return streamingUrl.replace(/\/$/, '');
+}
+
+function requestPublicBase(req) {
+  const host = req && req.headers && (req.headers['x-forwarded-host'] || req.headers.host);
+  if (host && process.env.PUBLIC_FROM_HOST !== '0') {
+    const fwdProto = req.headers['x-forwarded-proto'];
+    const proto = (fwdProto ? String(fwdProto).split(',')[0].trim() : '') || new URL(PUBLIC).protocol.replace(':', '');
+    return `${proto}://${String(host).split(',')[0].trim()}`;
+  }
+  return PUBLIC.replace(/\/$/, '');
+}
 
 const attempts = new Map(); // "type:id" -> how far down the list we have walked
 // A title played twice within a few minutes must not pay the swarm's cold start
@@ -117,12 +175,14 @@ function rank(stream, browser) {
   const remux = /\bremux\b/i.test(text) ? 1 : 0;
   const gb = Number((/([\d.]+)\s*GB/i.exec(text) || [])[1] || 0);
   const heavyFile = gb >= 4 ? 1 : 0;
+  const av1 = /\bav1\b/i.test(text) ? 1 : 0;
   const clear = /(e-?ac-?3|eac3|ddp|dd\+|ac-?3|aac|opus|mp3)/i.test(text);
   const mute = !clear && /(truehd|atmos|dts[- ]?hd|dts[- ]?x|\bdts\b|flac|pcm)/i.test(text);
   return [
     lonely,
     remux || heavyFile,
     mute ? 1 : 0,
+    av1,
     clear ? 0 : 1,
     heavy ? 1 : 0,
     q === -1 ? 99 : q,
@@ -174,38 +234,52 @@ function get(url, timeoutMs) {
 // spinner for a minute before it gives up. So the first kilobytes are read here
 // first: a source that cannot deliver them in a few seconds is treated as dead
 // and the next one is tried, before the player ever sees a URL.
-function delivers(url, need, within) {
+function delivers(url, need, within, redirects = 3) {
   return new Promise((resolve) => {
     const started = Date.now();
     let got = 0;
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      resolve(ok);
+    };
     const target = new URL(url);
     const lib = target.protocol === 'https:' ? https : http;
     const req = lib.get(url, { headers: { range: 'bytes=0-262143', 'user-agent': 'aio-failover/1.0' } }, (res) => {
-      if (res.statusCode >= 400) {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
         res.resume();
-        resolve(false);
+        let next;
+        try { next = new URL(res.headers.location, target).toString(); } catch (_) { finish(false); return; }
+        const left = Math.max(200, within - (Date.now() - started));
+        clearInterval(timer);
+        settled = true;
+        delivers(next, need, left, redirects - 1).then(resolve);
+        return;
+      }
+      if (res.statusCode >= 400 || res.statusCode >= 300) {
+        res.resume();
+        finish(false);
         return;
       }
       res.on('data', (chunk) => {
         got += chunk.length;
         if (got >= need) {
           req.destroy();
-          resolve(true);
+          finish(true);
         }
       });
-      res.on('end', () => resolve(got >= need));
+      res.on('error', () => finish(false));
+      res.on('end', () => finish(got >= need));
     });
     const timer = setInterval(() => {
       if (Date.now() - started > within) {
-        clearInterval(timer);
         req.destroy();
-        resolve(got >= need);
+        finish(got >= need);
       }
     }, 200);
-    req.on('error', () => {
-      clearInterval(timer);
-      resolve(false);
-    });
+    req.on('error', () => finish(false));
     req.on('close', () => clearInterval(timer));
   });
 }
@@ -243,7 +317,7 @@ function swarmAlive(target) {
 
 // A direct link is checked with a ranged GET: a dead host or a 403 must not be
 // handed to the player, and a few kilobytes is enough to know the link is real.
-function alive(url) {
+function alive(url, redirects = 3) {
   return new Promise((resolve) => {
     const target = new URL(url);
     const lib = target.protocol === 'https:' ? https : http;
@@ -251,7 +325,13 @@ function alive(url) {
       headers: { range: 'bytes=0-1', 'user-agent': 'aio-failover/1.0' },
     }, (res) => {
       res.resume();
-      resolve(res.statusCode >= 200 && res.statusCode < 400);
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
+        let next;
+        try { next = new URL(res.headers.location, target).toString(); } catch (_) { resolve(false); return; }
+        alive(next, redirects - 1).then(resolve);
+        return;
+      }
+      resolve(res.statusCode >= 200 && res.statusCode < 300);
     });
     req.setTimeout(PROBE_MS, () => { req.destroy(); resolve(false); });
     req.on('error', () => resolve(false));
@@ -365,7 +445,7 @@ async function filesFor(hash) {
   const known = fileLists.get(hash);
   if (known && Date.now() - known.at < 10 * 60 * 1000) return known.files;
   try {
-    const stats = await get(`http://127.0.0.1:11470/stats.json`, 4000);
+    const stats = await get(`${STREAMING}/stats.json`, 4000);
     const entry = stats && stats[hash.toLowerCase().slice(0, 40)];
     const files = (entry && entry.files) || [];
     if (files.length) {
@@ -482,8 +562,8 @@ async function subtitlesFor(type, id, release) {
       id: String(row.id || index),
       lang: 'eng',
       title: String(row.subtitleFileName || row.movieReleaseName || `English ${index + 1}`).slice(0, 70),
-      // Served by this addon, converted to VTT, one stable URL per track.
-      url: `${PUBLIC}/vtt/${vttToken(row.url)}.vtt`,
+      // Token resolved relative to the client's request origin in /subtitles/.
+      token: vttToken(row.url),
     }));
 }
 
@@ -510,6 +590,11 @@ function keepWarm(hash, fileAt) {
   // Warm the file the panel is about to ask for: warming file 0 of a season
   // pack warms the pilot, which is the wrong episode at 200 MB a minute.
   const req = http.get(`${STREAMING}/${hash}/${index}`, { headers: { Range: 'bytes=0-1048575' } }, (res) => {
+    if (res.statusCode >= 400) {
+      res.resume();
+      held.delete(key);
+      return;
+    }
     res.on('data', () => {});
     res.on('end', () => held.delete(key));
     res.on('error', () => held.delete(key));
@@ -535,7 +620,7 @@ function playUrl(stream) {
 // are loaded at once and their stats are polled until one reports peers or the
 // budget runs out. Nothing is awaited in series: the answer costs the slowest
 // load, not the sum of them.
-async function firstLive(list, orderUnsorted, windowMs, maxProbes) {
+async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
   let order = orderUnsorted;
   // How many candidates this call is allowed to load. Every probe leaves a
   // torrent loaded on the engine, so a stream request that probes the whole
@@ -553,7 +638,7 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes) {
     const target = playUrl(stream);
     const match = /^https?:\/\/[^/]+\/([0-9a-f]{40})\//i.exec(target);
     if (!match) continue;
-    loaded.push({ at, target, hash: match[1].toLowerCase() });
+    loaded.push({ at, target, hash: match[1].toLowerCase(), hasFileIdx: Number.isInteger(stream.fileIdx) });
     if (loaded.length >= probeCap) break;
   }
   if (!loaded.length) return null;
@@ -562,9 +647,19 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes) {
   // whole window — that is what a player does — and are dropped once the answer
   // is known.
   const open = [];
+  const failed = new Set();
   for (const item of loaded) {
-    const req = http.get(item.target, { headers: { 'user-agent': 'aio-failover/1.0' } });
-    req.on('error', () => {});
+    const req = http.get(item.target, { headers: { 'user-agent': 'aio-failover/1.0' } }, (res) => {
+      if (res.statusCode >= 400 || (res.statusCode >= 300 && !res.headers.location)) {
+        failed.add(item.hash);
+        res.resume();
+        req.destroy();
+        return;
+      }
+      res.on('data', () => {});
+      res.on('error', () => {});
+    });
+    req.on('error', () => failed.add(item.hash));
     req.setTimeout(probeWindow + 2000, () => req.destroy());
     open.push({ req, hash: item.hash });
   }
@@ -578,18 +673,22 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes) {
     }
   };
   const deadline = Date.now() + probeWindow;
-  let best = null;
-  while (Date.now() < deadline) {
+  const needBytes = Number(process.env.DELIVERS_MIN_BYTES || 1024);
+  const deliversWait = Number(process.env.DELIVERS_MS || 6000);
+  while (Date.now() < deadline && failed.size < loaded.length) {
     await new Promise((resolve) => setTimeout(resolve, 250));
+    if (failed.size >= loaded.length) break;
     const stats = await readStats();
     if (!stats) continue;
+    let best = null;
     for (const item of loaded) {
+      if (failed.has(item.hash)) continue;
       const row = stats[item.hash];
       if (!row) continue;
       const peers = Number(row.peers || 0);
       // A peer that never sends is not a source: the wires carry the rate, and
       // a torrent whose only peer is silent looks exactly like a dead one to a
-      // player. 200 KB/s is past what a 1080p stream needs to start.
+      // player.
       const rate = (row.wires || []).reduce(
         (most, wire) => Math.max(most, Number(wire.downSpeed || 0)),
         0,
@@ -599,32 +698,63 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes) {
       }
     }
     // The rate is the swarm's, not this file's: a season pack can have fast
-    // peers and no complete copy of the episode that was asked for. So the
-    // fastest few are asked for their first kilobytes before one is handed over.
+    // peers and no complete copy of the episode that was asked for. So `best`
+    // and the next fastest candidates are verified for real byte delivery.
     if (best) {
-      close();
-      const want = loaded.slice(0, 4);
+      close(best.hash);
+      const rest = loaded.filter((item) => item.hash !== best.hash && !failed.has(item.hash)).slice(0, 3);
+      const want = [best, ...rest];
       const race = await Promise.all(
-        want.map(async (item) => ((await delivers(item.target, 16 * 1024, 6000)) ? item : null)),
+        want.map(async (item) => {
+          let verifyUrl = item.target;
+          if (!item.hasFileIdx && id) {
+            const idx = await fileIndexFor(item.hash, id);
+            verifyUrl = `${STREAMING}/${item.hash}/${idx}`;
+          }
+          return (await delivers(verifyUrl, needBytes, Math.min(deliversWait, Math.max(500, deadline - Date.now() + 1000))))
+            ? { ...item, target: verifyUrl }
+            : null;
+        }),
       );
       const winner = race.find(Boolean);
-      // Report the winner's own swarm rate, not a placeholder: the log is how the
-      // next slow start gets diagnosed instead of guessed at.
       if (winner) {
+        close();
         const row = (stats && stats[winner.hash]) || {};
         const rate = (row.wires || []).reduce((most, wire) => Math.max(most, Number(wire.downSpeed || 0)), 0);
         return { ...winner, peers: Number(row.peers || 0), rate };
       }
-      return best;
+      for (const item of want) failed.add(item.hash);
     }
   }
   close();
-  return best;
+  return null;
+}
+
+async function firstLiveHttp(list) {
+  const httpCandidates = list
+    .map((stream, at) => ({ stream, at }))
+    .filter(({ stream }) => isMediaLink(stream))
+    .slice(0, 4);
+  if (!httpCandidates.length) return null;
+  const needBytes = Number(process.env.DELIVERS_MIN_BYTES || 1024);
+  const race = await Promise.all(
+    httpCandidates.map(async ({ stream, at }) => (
+      (await delivers(stream.url, needBytes, Math.max(PROBE_MS, 4000)))
+        ? { at, hash: null, target: stream.url, peers: 0, rate: 0 }
+        : null
+    )),
+  );
+  return race.find(Boolean) || null;
 }
 
 function readStats() {
   return new Promise((resolve) => {
     const req = http.get(`${STREAMING}/stats.json`, { timeout: 1500 }, (res) => {
+      if (res.statusCode >= 400) {
+        res.resume();
+        resolve(null);
+        return;
+      }
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { body += chunk; });
@@ -642,12 +772,31 @@ function readStats() {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, PUBLIC);
+  const pubBase = requestPublicBase(req);
+  const url = new URL(req.url, pubBase);
   const path = url.pathname;
   // One line per request: the only way to see whether the TV reached this box.
   console.log(`${new Date().toISOString()} ${req.socket.remoteAddress} ${req.headers['user-agent'] || '-'} ${path}`);
 
   try {
+    if (path === '/healthz') {
+      const [hubRes, streamRes] = await Promise.allSettled([
+        get(HUB, 3000),
+        get(`${STREAMING}/settings`, 2500),
+      ]);
+      const hubOk = hubRes.status === 'fulfilled' && Boolean(hubRes.value && hubRes.value.id);
+      const streamingOk = streamRes.status === 'fulfilled' && Boolean(streamRes.value && streamRes.value.values);
+      const ok = hubOk && streamingOk;
+      res.writeHead(ok ? 200 : 503, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      res.end(jsonSafe({
+        ok,
+        engine: resolveEngineBase(),
+        hub: { ok: hubOk, ...(hubOk ? {} : { error: hubRes.reason ? String(hubRes.reason.message || hubRes.reason) : 'bad manifest' }) },
+        streaming: { ok: streamingOk, ...(streamingOk ? {} : { error: streamRes.reason ? String(streamRes.reason.message || streamRes.reason) : 'bad settings' }) },
+      }));
+      return;
+    }
+
     if (path === '/manifest.json') {
       const manifest = {
         id: 'org.aiostre.am',
@@ -691,7 +840,7 @@ const server = http.createServer(async (req, res) => {
     const subtitleMatch = path.match(/^\/subtitles\/([^/]+)\/(.+)\.json$/);
     if (subtitleMatch) {
       const subType = subtitleMatch[1];
-      const subId = decodeURIComponent(subtitleMatch[2]);
+      const subId = decodeId(subtitleMatch[2]);
       const picked = streamChoice.get(`${subType}:${subId}`);
       const release = picked ? [picked.releaseName, picked.releaseTitle].filter(Boolean).join(' ') : '';
       const cacheKey = `${subType}:${subId}:${release}`;
@@ -700,18 +849,17 @@ const server = http.createServer(async (req, res) => {
         tracks = { rows: await subtitlesFor(subType, subId, release), expires: Date.now() + 10 * 60 * 1000 };
         subtitleCache.set(cacheKey, tracks);
       }
+      const mapped = tracks.rows.map(({ token, ...row }) => ({ ...row, url: `${pubBase}/vtt/${token}.vtt` }));
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-      res.end(jsonSafe({ subtitles: tracks.rows }));
+      res.end(jsonSafe({ subtitles: mapped }));
       return;
     }
 
     const streamMatch = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
     if (streamMatch) {
-      // The panel percent-encodes the id once (`tt2193021%3A1%3A4`). Handing
-      // that to the hub un-decoded resolved a different episode — the panel
-      // played the premiere while the row said 1x4.
+      // The panel percent-encodes the id (`tt2193021%3A1%3A4` or double-encoded).
       const type = streamMatch[1];
-      const id = decodeURIComponent(streamMatch[2]);
+      const id = decodeId(streamMatch[2]);
       const uaStream = String(req.headers['user-agent'] || '');
       const isBrowser = /Chrome|Mozilla|Safari|Firefox/i.test(uaStream);
       const list = await candidates(type, id, isBrowser);
@@ -720,67 +868,76 @@ const server = http.createServer(async (req, res) => {
         res.end(jsonSafe({ streams: [] }));
         return;
       }
-      // The single row must be a source that is delivering: the hub's order is
-      // a claim about swarms, and a claim is not a fact. Probing here costs a
-      // few seconds once and removes the whole class of 'it spins forever'.
+      // The single row must be a source that is actually delivering: probing
+      // here costs a few seconds once and removes 'it spins forever'.
       const cacheKey = `${type}:${id}`;
       const cached = streamChoice.get(cacheKey);
       let live = null;
-      if (cached && Date.now() - cached.at < CHOICE_TTL_MS) {
-        live = list.find((row) => (row.infoHash || '') === cached.hash) ? cached : null;
-      }
-      if (!live) {
-        const probed = await firstLive(list, list.map((_, step) => step), Number(process.env.STREAM_PROBE_MS || 6000), Number(process.env.STREAM_PROBES || 8)).catch(() => null);
-        if (probed) {
-          live = { at: probed.at, hash: probed.hash, peers: probed.peers, rate: probed.rate, at_ms: Date.now() };
-          streamChoice.set(cacheKey, { ...live, at: Date.now() });
+      if (cached && cached.hash && Date.now() - Number(cached.cachedAt || 0) < CHOICE_TTL_MS) {
+        const stillIdx = list.findIndex((row) => (row.infoHash || '').toLowerCase() === cached.hash.toLowerCase());
+        if (stillIdx >= 0) {
+          const stats = await readStats();
+          if (stats && stats[cached.hash] && Number(stats[cached.hash].peers || 0) > 0) {
+            live = { ...cached, at: stillIdx };
+          }
         }
       }
-      const top = live && list[live.at] ? list[live.at] : list[0];
+      if (!live) {
+        const probed = await firstLive(
+          list,
+          list.map((_, step) => step),
+          Number(process.env.STREAM_PROBE_MS || 6000),
+          Number(process.env.STREAM_PROBES || 8),
+          id,
+        ).catch((err) => {
+          console.error(`firstLive error for ${cacheKey}:`, err && err.message ? err.message : err);
+          return null;
+        });
+        if (probed) {
+          live = { at: probed.at, hash: probed.hash, peers: probed.peers, rate: probed.rate, cachedAt: Date.now() };
+          streamChoice.set(cacheKey, live);
+        }
+      }
+      if (!live) {
+        live = await firstLiveHttp(list).catch((err) => {
+          console.error(`firstLiveHttp error for ${cacheKey}:`, err && err.message ? err.message : err);
+          return null;
+        });
+      }
+      if (!live || !list[live.at]) {
+        console.log(`no live source for ${cacheKey} (${list.length} candidates)`);
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+        res.end(jsonSafe({ streams: [] }));
+        return;
+      }
+      const top = list[live.at];
       const label = `${ADDON_NAME} · ${(top.name || '').replace(/^\[[^\]]*\]\s*/, '').slice(0, 28)}`;
-      // Remember what release was handed to the player: the subtitle request
-      // arrives by title id alone, and this is the only thing that can tell a
-      // matching track from a foreign one.
       streamChoice.set(cacheKey, {
-        ...(streamChoice.get(cacheKey) || { at: Date.now() }),
+        ...(streamChoice.get(cacheKey) || live),
+        cachedAt: Date.now(),
         releaseName: String(top.name || ''),
         releaseTitle: [top.title, top.description, (top.behaviorHints && top.behaviorHints.filename)]
           .filter(Boolean)
           .join(' '),
       });
-      // A native client has its own torrent engine and plays peer to peer far
-      // better than a LAN hop through this host's streaming server. A browser
-      // has none, so it gets the redirect. The user agent is the only signal a
-      // Stremio addon is given about who is asking.
-      const ua = String(req.headers['user-agent'] || '');
-      const native = /Stremio/i.test(ua) && !/Chrome|Mozilla|Safari/i.test(ua);
-      // One row is one dead swarm away from a player that spins forever with
-      // nothing to choose: Stremio cannot fall back because the addon gave it
-      // no second entry. A native client gets five ranked sources instead, so a
-      // torrent with no reachable peers is skipped by hand in one press.
-      // A native client plays a torrent through its OWN engine, on its own
-      // box: the TV's swarm is not this host's swarm, and a torrent this host
-      // has warm can be peerless from the TV, which is a splash screen that
-      // never ends. When the source is a torrent, the row points at this
-      // host's streaming server instead — the swarm that was measured.
       const hash = (live && live.hash) || top.infoHash || (/\/([0-9a-f]{40})\//i.exec(top.url || '') || [])[1];
-      const engine = STREAMING.replace("127.0.0.1", new URL(PUBLIC).hostname);
+      const engine = resolveEngineBase();
+      let engineHost = '';
+      try { engineHost = new URL(engine).hostname; } catch (_) {}
+      if (hash && isLoopbackHost(engineHost) && process.env.ALLOW_LOOPBACK_STREAMING !== '1') {
+        console.error(`refusing unroutable engine url ${engine} for ${cacheKey}`);
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+        res.end(jsonSafe({ streams: [] }));
+        return;
+      }
       const fileAt = hash ? await fileIndexFor(hash, id) : 0;
-      // Every torrent row points at this host's streaming engine, whatever the
-      // client calls itself. Wrapping it in /play meant the player's first
-      // request paid the probe, and every retry paid it again — a player that
-      // retries once a second never gets a picture. The engine is a plain HTTP
-      // video source, which both a browser and a native player understand.
       const streams = [{
         ...(hash ? {} : top),
         name: ADDON_NAME,
         title: label,
-        url: hash ? `${engine}/${hash}/${fileAt}` : `${PUBLIC}/play/${type}/${id}`,
+        url: hash ? `${engine}/${hash}/${fileAt}` : (live.target || `${pubBase}/play/${type}/${encodeURIComponent(id)}`),
         behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
       }];
-      // Warm before answering: the panel fetches /stream once and then shows
-      // the row, which gives the engine the few seconds it needs to load the
-      // swarm. The player's own request then finds it ready.
       if (hash) keepWarm(hash, fileAt);
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
       res.end(jsonSafe({ streams }));
@@ -790,17 +947,7 @@ const server = http.createServer(async (req, res) => {
     const playMatch = path.match(/^\/play\/([^/]+)\/(.+)$/);
     if (playMatch) {
       const [, type, rawId] = playMatch;
-      // The panel encodes the id once and some of its own requests encode the
-      // already-encoded path again (`tt2193021%253A1%253A3`). Decoding once left
-      // `%3A` in the id, the hub resolved a different episode, and the row said
-      // 1x3 while the premiere played. Decode until the string stops changing.
-      let id = rawId;
-      for (let pass = 0; pass < 3; pass += 1) {
-        let next = id;
-        try { next = decodeURIComponent(id); } catch (_) { break; }
-        if (next === id) break;
-        id = next;
-      }
+      const id = decodeId(rawId);
       const key = `${type}:${id}`;
       const list = await candidates(type, id, true);
       if (!list.length) {
@@ -859,7 +1006,7 @@ const server = http.createServer(async (req, res) => {
       // Torrentio result can say thirty-three seeders while the engine finds
       // nobody. The engine's own stats are the fact, so a few torrents are
       // loaded at once and the first one that reports peers is the answer.
-      const live = await firstLive(list, order);
+      const live = await firstLive(list, order, undefined, undefined, id);
       if (live) {
         attempts.set(key, { index: live.at + 1, at: Date.now() });
         // Proxied, not redirected. The player is on another device and a 302 to
@@ -907,6 +1054,24 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`${ADDON_NAME} on ${PUBLIC} -> ${HUB_BASE}`);
-});
+if (require.main === module) {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`${ADDON_NAME} on ${PUBLIC} -> ${HUB_BASE}`);
+  });
+}
+
+module.exports = {
+  server,
+  decodeId,
+  rank,
+  better,
+  englishOnly,
+  isPlaceholder,
+  isMediaLink,
+  resolveEngineBase,
+  requestPublicBase,
+  delivers,
+  alive,
+  firstLive,
+  firstLiveHttp,
+};
