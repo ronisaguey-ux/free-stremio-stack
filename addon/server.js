@@ -149,8 +149,66 @@ function englishOnly(stream) {
   return !FOREIGN_TAG.test(text);
 }
 
+// What the panel can put a picture on screen from. H.264 decodes everywhere and
+// is the only codec this stack has ever seen work; HEVC, AV1 and VP9 open the
+// stream, play the audio, and show nothing at all, which is the failure that
+// turned an Arrow episode into a radio play. Capability is a setting, not a
+// guess about the client: the panel's user agent is a lie (the Stremio core
+// asks for addons, not the player) so the release name and, above all, the
+// file's own codec id decide.
+const PLAYABLE_CODECS = new Set(
+  String(process.env.PLAYABLE_VIDEO_CODECS || 'h264')
+    .toLowerCase()
+    .split(/[\s,]+/)
+    .filter(Boolean),
+);
+
+function videoAllowed(codec) {
+  return !codec || PLAYABLE_CODECS.has(codec);
+}
+
+const CODEC_MARKERS = [
+  ['hevc', ['V_MPEGH/ISO/HEVC', 'dvh1', 'dva1', 'hvc1', 'hev1']],
+  ['av1', ['V_AV1', 'av01']],
+  ['vp9', ['V_VP9', 'vp09']],
+  ['h264', ['V_MPEG4/ISO/AVC', 'avc1', 'avc3']],
+];
+
+// The container's own id, read from the first kilobytes: a Matroska Tracks
+// element names its codec within a few hundred bytes, an MP4 names it in the
+// sample entry. A release name is a claim and can be wrong or silent; this
+// cannot.
+function codecFromBytes(head) {
+  if (!head || head.length < 64) return null;
+  const texts = [];
+  for (const [codec, marks] of CODEC_MARKERS) {
+    for (const mark of marks) {
+      if (head.indexOf(mark) !== -1) {
+        texts.push(codec);
+        break;
+      }
+    }
+  }
+  return texts[0] || null;
+}
+
+function codecFromLabel(text) {
+  const line = String(text || '');
+  if (/\b(x265|h\.?265|hevc)\b/i.test(line)) return 'hevc';
+  if (/\bav1\b/i.test(line)) return 'av1';
+  if (/\bvp9\b/i.test(line)) return 'vp9';
+  if (/\b(x264|h\.?264|avc)\b/i.test(line)) return 'h264';
+  return null;
+}
+
+function labelOf(stream) {
+  return `${stream.name || ''} ${stream.title || ''} ${stream.description || ''} ${
+    (stream.behaviorHints && stream.behaviorHints.filename) || ''
+  }`;
+}
+
 function rank(stream, browser) {
-  const text = `${stream.name || ''} ${stream.title || ''} ${stream.description || ''}`.toLowerCase();
+  const text = labelOf(stream).toLowerCase();
   // A browser cannot decode HEVC at all and 10-bit HEVC in no case: the stream
   // opens, the player shows nothing, and it looks like the addon hung.
   const heavy = browser && /(hevc|h\.?265|x265|10 ?bit)/i.test(text);
@@ -178,8 +236,10 @@ function rank(stream, browser) {
   const av1 = /\bav1\b/i.test(text) ? 1 : 0;
   const clear = /(e-?ac-?3|eac3|ddp|dd\+|ac-?3|aac|opus|mp3)/i.test(text);
   const mute = !clear && /(truehd|atmos|dts[- ]?hd|dts[- ]?x|\bdts\b|flac|pcm)/i.test(text);
+  const codec = codecFromLabel(labelOf(stream));
   return [
     lonely,
+    videoAllowed(codec) ? 0 : 1,
     remux || heavyFile,
     mute ? 1 : 0,
     av1,
@@ -279,6 +339,64 @@ function delivers(url, need, within, redirects = 3) {
         finish(got >= need);
       }
     }, 200);
+    req.on('error', () => finish(false));
+    req.on('close', () => clearInterval(timer));
+  });
+}
+
+// The same ranged read, keeping the bytes: the head of the file is the only
+// place the real video codec is written down, and it is what decides whether the
+// panel can show a picture.
+const CODEC_SNIFF_BYTES = 262144;
+
+function headBytes(url, within, redirects = 3) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const chunks = [];
+    let got = 0;
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      resolve(ok ? Buffer.concat(chunks) : null);
+    };
+    const target = new URL(url);
+    const lib = target.protocol === 'https:' ? https : http;
+    const timer = setInterval(() => {
+      if (Date.now() - started > within + 1500) {
+        req.destroy();
+        finish(got >= 1024);
+      }
+    }, 200);
+    const req = lib.get(url, {
+      headers: { range: `bytes=0-${CODEC_SNIFF_BYTES - 1}`, 'user-agent': 'aio-failover/1.0' },
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
+        res.resume();
+        let next;
+        try { next = new URL(res.headers.location, target).toString(); } catch (_) { finish(false); return; }
+        clearInterval(timer);
+        settled = true;
+        headBytes(next, Math.max(400, within - (Date.now() - started)), redirects - 1).then(resolve);
+        return;
+      }
+      if (res.statusCode >= 300) {
+        res.resume();
+        finish(false);
+        return;
+      }
+      res.on('data', (chunk) => {
+        chunks.push(chunk);
+        got += chunk.length;
+        if (got >= CODEC_SNIFF_BYTES) {
+          req.destroy();
+          finish(true);
+        }
+      });
+      res.on('error', () => finish(got >= 1024));
+      res.on('end', () => finish(got >= 1024));
+    });
     req.on('error', () => finish(false));
     req.on('close', () => clearInterval(timer));
   });
@@ -675,6 +793,10 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
   const deadline = Date.now() + probeWindow;
   const needBytes = Number(process.env.DELIVERS_MIN_BYTES || 1024);
   const deliversWait = Number(process.env.DELIVERS_MS || 6000);
+  // A source with bytes but no decodable picture: it plays as sound only, which
+  // is the bug this guard exists for. Kept only for a title where nothing else
+  // answers.
+  let fallback = null;
   while (Date.now() < deadline && failed.size < loaded.length) {
     await new Promise((resolve) => setTimeout(resolve, 250));
     if (failed.size >= loaded.length) break;
@@ -711,22 +833,43 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
             const idx = await fileIndexFor(item.hash, id);
             verifyUrl = `${STREAMING}/${item.hash}/${idx}`;
           }
-          return (await delivers(verifyUrl, needBytes, Math.min(deliversWait, Math.max(500, deadline - Date.now() + 1000))))
-            ? { ...item, target: verifyUrl }
-            : null;
+          const within = Math.min(deliversWait, Math.max(500, deadline - Date.now() + 1000));
+          const head = await headBytes(verifyUrl, within);
+          if (!head) return null;
+          // The bytes are the verdict: a codec the panel cannot decode is not
+          // "lower quality", it is a stream with no picture, so it is skipped
+          // as dead and the loop walks to one that has a picture.
+          const codec = codecFromBytes(head) || codecFromLabel(labelOf(list[item.at]));
+          return { ...item, target: verifyUrl, codec };
         }),
       );
-      const winner = race.find(Boolean);
+      const decodable = race.filter(Boolean).filter((row) => videoAllowed(row.codec));
+      const winner = decodable[0];
       if (winner) {
         close();
         const row = (stats && stats[winner.hash]) || {};
         const rate = (row.wires || []).reduce((most, wire) => Math.max(most, Number(wire.downSpeed || 0)), 0);
         return { ...winner, peers: Number(row.peers || 0), rate };
       }
-      for (const item of want) failed.add(item.hash);
+      // Nothing with a picture in this round: keep one source back so a title
+      // whose only copies are HEVC still plays something, and keep looking.
+      for (const row of race.filter(Boolean)) {
+        if (!fallback) fallback = row;
+      }
+      // Only what failed or cannot be decoded is retired. A decodable
+      // candidate that simply lost the race stays for the next round, or the
+      // HEVC source ranked first would take the working H.264 down with it.
+      for (const item of want) {
+        const row = race.find((candidate) => candidate && candidate.hash === item.hash);
+        if (!row || !videoAllowed(row.codec)) failed.add(item.hash);
+      }
     }
   }
   close();
+  if (fallback) {
+    console.log(`only undecodable video for ${id || 'title'} (${fallback.codec}); using it`);
+    return { ...fallback, peers: 0, rate: 0 };
+  }
   return null;
 }
 
@@ -736,15 +879,17 @@ async function firstLiveHttp(list) {
     .filter(({ stream }) => isMediaLink(stream))
     .slice(0, 4);
   if (!httpCandidates.length) return null;
-  const needBytes = Number(process.env.DELIVERS_MIN_BYTES || 1024);
   const race = await Promise.all(
-    httpCandidates.map(async ({ stream, at }) => (
-      (await delivers(stream.url, needBytes, Math.max(PROBE_MS, 4000)))
-        ? { at, hash: null, target: stream.url, peers: 0, rate: 0 }
-        : null
-    )),
+    httpCandidates.map(async ({ stream, at }) => {
+      const head = await headBytes(stream.url, Math.max(PROBE_MS, 4000));
+      if (!head) return null;
+      const codec = codecFromBytes(head) || codecFromLabel(labelOf(stream));
+      return { at, hash: null, target: stream.url, peers: 0, rate: 0, codec };
+    }),
   );
-  return race.find(Boolean) || null;
+  const rows = race.filter(Boolean);
+  const decodable = rows.filter((row) => videoAllowed(row.codec));
+  return decodable[0] || rows[0] || null;
 }
 
 function readStats() {
@@ -1072,6 +1217,10 @@ module.exports = {
   requestPublicBase,
   delivers,
   alive,
+  headBytes,
+  codecFromBytes,
+  codecFromLabel,
+  videoAllowed,
   firstLive,
   firstLiveHttp,
 };

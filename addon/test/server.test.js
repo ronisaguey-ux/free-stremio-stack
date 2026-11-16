@@ -311,3 +311,82 @@ test('/stream falls back to verified direct HTTP 307 media link when torrents ar
     await closeSrv(mediaSrv);
   }
 });
+
+test('video codec is read from the file bytes, not from the release name', () => {
+  const matroskaHead = (codec) => {
+    const buf = Buffer.alloc(4096, 0);
+    buf.write('\x1aE\xdf\xa3', 0, 'binary');
+    buf.write(codec, 200, 'binary');
+    return buf;
+  };
+  assert.equal(mod.codecFromBytes(matroskaHead('V_MPEGH/ISO/HEVC')), 'hevc');
+  assert.equal(mod.codecFromBytes(matroskaHead('V_AV1')), 'av1');
+  assert.equal(mod.codecFromBytes(matroskaHead('V_MPEG4/ISO/AVC')), 'h264');
+  assert.equal(mod.codecFromBytes(matroskaHead('V_VP9')), 'vp9');
+  assert.equal(mod.codecFromBytes(Buffer.alloc(4096, 0)), null);
+
+  assert.equal(mod.codecFromLabel('Arrow.S01E08.1080p.BluRay.x265-RARBG'), 'hevc');
+  assert.equal(mod.codecFromLabel('Arrow.S01E08.1080p.BluRay.AV1-PTNX'), 'av1');
+  assert.equal(mod.codecFromLabel('Arrow.S01E08.1080p.BluRay.x264-ROVERS'), 'h264');
+  assert.equal(mod.codecFromLabel('Arrow.S01E08.BDRip.1080p'), null);
+
+  // The panel has shown a picture for H.264 and only for H.264.
+  assert.equal(mod.videoAllowed('h264'), true);
+  assert.equal(mod.videoAllowed('hevc'), false);
+  assert.equal(mod.videoAllowed('av1'), false);
+  assert.equal(mod.videoAllowed(null), true);
+});
+
+test('/stream skips a source whose video track cannot be decoded even when it ranks first', async () => {
+  const hevcHash = 'a'.repeat(40);
+  const avcHash = 'b'.repeat(40);
+  const head = (codec) => {
+    const buf = Buffer.alloc(8192, 0);
+    buf.write('\x1aE\xdf\xa3', 0, 'binary');
+    buf.write(codec, 300, 'binary');
+    return buf;
+  };
+  await withMockStack(
+    {
+      hub: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          streams: [
+            // No codec token in the name: the bytes are the only evidence.
+            { name: '[P2P] Torrentio 1080p', title: 'Arrow.S01E08.BDRip.1080p', description: '\ud83d\udc65 40', infoHash: hevcHash, fileIdx: 7 },
+            { name: '[P2P] Torrentio 1080p', title: 'Arrow.S01E08.BDRip.720p', description: '\ud83d\udc65 4', infoHash: avcHash, fileIdx: 7 },
+          ],
+        }));
+      },
+      streaming: (req, res) => {
+        if (req.url === '/stats.json') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            [hevcHash]: { peers: 20, wires: [{ downSpeed: 4000000 }], files: [] },
+            [avcHash]: { peers: 4, wires: [{ downSpeed: 2000000 }], files: [] },
+          }));
+          return;
+        }
+        if (req.url.startsWith(`/${hevcHash}/`)) {
+          res.writeHead(206, { 'Content-Type': 'video/x-matroska' });
+          res.end(head('V_MPEGH/ISO/HEVC'));
+          return;
+        }
+        if (req.url.startsWith(`/${avcHash}/`)) {
+          res.writeHead(206, { 'Content-Type': 'video/x-matroska' });
+          res.end(head('V_MPEG4/ISO/AVC'));
+          return;
+        }
+        res.writeHead(500);
+        res.end();
+      },
+    },
+    { STREAM_PROBE_MS: '3000' },
+    async ({ addonUrl }) => {
+      const res = await fetchJson(`${addonUrl}/stream/series/tt2193021%3A1%3A8.json`);
+      assert.equal(res.status, 200);
+      assert.equal(res.body.streams.length, 1);
+      assert.match(res.body.streams[0].url, new RegExp(avcHash), 'the H.264 source must be the one handed to the player');
+    },
+  );
+});
