@@ -233,23 +233,31 @@ A cold torrent reports `peers:0` / `0 B/s` for several seconds after
 `/create`, so an 1800 ms window rejects every candidate — including torrents
 that are healthy two seconds later.
 
-**Fix applied (env only, no code change):**
+**Fix applied (env only, no code change)** — the knobs that actually matter:
+
 ```bash
 mkdir -p /etc/systemd/system/aiostrem.service.d
-printf '[Service]\nEnvironment=PROBE_MS=12000\n' > /etc/systemd/system/aiostrem.service.d/probe.conf
+cat > /etc/systemd/system/aiostrem.service.d/probe.conf <<'EOF'
+[Service]
+Environment=PROBE_MS=4500                 # per-torrent stats poll
+Environment=PROBE_DEADLINE_MS=5000
+Environment=PLAYABLE_BYTES_PER_SEC=120000 # was 600000 (4.8 Mbit) — cold swarms never clear it
+Environment=WANT=25                       # 60 probes left swarms spinning and answered late
+Environment=LIVE_WINDOW_MS=3500           # the loop that waits for a live wire
+Environment=DELIVERS_MS=2000              # the byte-delivery confirmation
+EOF
 systemctl daemon-reload && systemctl restart aiostrem
 ```
-Measured: first request per title **≈9-10 s**, second identical request **≈1.0 s**
-(the addon caches per title). The TV drops the loading row at ~10 s, so the first
-open can still show nothing — **reopen the sources panel and it fills
-immediately**.
 
-Cheaper follow-ups, in order of value:
-1. warm the cache for the title on details-open (a preflight `/stream/…` call);
-2. run the probe with `PLAYABLE_BYTES_PER_SEC` lowered to ~150 k for the first
-   pass and re-rank upwards as rates settle;
-3. keep `PROBE_DEADLINE_MS` just under the client's patience (≈9 s) so the
-   response never arrives after the row has been dropped.
+Measured with these values: **≈5.1 s** for a cold title (was 9-10 s and the TV
+dropped the row before it arrived), **≈1 s** on the second request (the addon
+caches per title). With `PLAYABLE_BYTES_PER_SEC=600000` and `WANT=40` a series
+like *Future Man* returned `{"streams":[]}` after probing 40 candidates; the same
+request answers 1080p once the rate floor is realistic.
+
+Keep the total under the client's patience (≈10 s, observed: the row reliably
+disappears at 10 s) — `LIVE_WINDOW_MS + DELIVERS_MS` is that budget.
+
 
 ---
 
