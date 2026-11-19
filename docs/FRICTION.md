@@ -67,7 +67,9 @@ text node at the click target.
   pressing anything else.
 
 ### 1.6 The Add-addon modal
-- The button is labelled **Add**, not "Install".
+- With the URL typed, the button is labelled **Add**. After Enter the modal
+  switches to the manifest preview and the same button becomes **Install** —
+  looking for "Add" after the preview is why the install looked impossible.
 - The URL field is the second `input[type=text]`; its placeholder is
   **`Paste addon URL`**. The first text input is the addon *search* box — typing
   the URL there silently does nothing.
@@ -99,6 +101,19 @@ same text).
 
 **Rule:** install in the web app, verify with `addonCollectionGet`, remove with
 the API. Do not trust `{}` from `Add` as success.
+
+**A removed addon comes back while a client is logged in.** The web tab and the
+TV each hold their own copy and push it back on the next sync, so an API
+`addonCollectionRemove` can be silently undone a few seconds later (observed
+twice; the entry reappeared with the same `transportUrl`). Remove it on the
+device that holds it, or with every client closed.
+
+Removing on the Android TV: open the Addons screen, press/hold (or long-press
+DPAD_CENTER, `adb shell input keyevent --longpress 23`) on the addon card → a
+dialog appears showing **URL: …** and **Uninstall** → tap Uninstall. The dialog
+is the only place the TV tells you which URL that card is bound to, which is how
+you tell a stale duplicate from the good one.
+
 
 ---
 
