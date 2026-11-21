@@ -242,11 +242,18 @@ function rank(stream, browser) {
   // which is a spinner, not a preference. A playable file that streams beats a
   // perfect file that cannot: `lonely` still outranks everything, and the codec
   // gate below it drops AV1/HEVC outright.
+  // Swarm first, then the size of the picture. A 2160p release with four peers
+  // opened a black screen that polled stats for a minute (the panel has to pull
+  // the whole thing itself), while a 1080p with forty-five started instantly.
+  // A 4K stream only wins when it is seeded like the 1080p one is.
+  const uhd = /\b(2160p|4k)\b/i.test(text) ? 1 : 0;
+  const uhdHealthy = uhd && seeders >= 30 ? 0 : uhd;
   return [
     lonely,
     videoAllowed(codec) ? 0 : 1,
-    q === -1 ? 99 : q,
     -seeders,
+    uhdHealthy,
+    q === -1 ? 99 : q,
     mute ? 1 : 0,
     remux || heavyFile,
     clear ? 0 : 1,
