@@ -114,6 +114,11 @@ test('unit helpers: decodeId, resolveEngineBase, requestPublicBase, rank', () =>
   assert.ok(mod.better(busy720, h264) < 0, 'a far bigger swarm beats one step of resolution');
   const same768 = { name: 'T 1080p', title: 'Show.1080p.HDTV.H.264.DDP5.1', description: '👥 20', infoHash: 'h'.repeat(40) };
   assert.ok(mod.better(same768, h264) >= 0, 'equal swarm and quality keep a stable order');
+
+  // Dolby renders silence on a plain HDMI-to-TV chain; AAC always decodes in
+  // software, so at equal quality and swarm the universal codec wins.
+  const aac = { name: 'T 1080p', title: 'Show.1080p.WEB-DL.H.264.AAC2.0', description: '👥 20', infoHash: 'i'.repeat(40) };
+  assert.ok(mod.better(aac, h264) < 0, 'AAC beats DD 5.1 at equal swarm');
 });
 
 test('delivers follows 307 redirect and fails on 500 or insufficient bytes', async () => {
