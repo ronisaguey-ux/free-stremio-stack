@@ -852,6 +852,19 @@ function playUrl(stream) {
 // are loaded at once and their stats are polled until one reports peers or the
 // budget runs out. Nothing is awaited in series: the answer costs the slowest
 // load, not the sum of them.
+// A 1080p encode needs roughly two megabytes a second to keep a Fire TV from
+// stalling; 0.6 MB/s played for a few seconds and then buffered forever, which
+// reads as the same complaint as a dead swarm. The floor follows the picture
+// size, and an explicit PLAYABLE_BYTES_PER_SEC still overrides all of it.
+function neededRate(stream) {
+  if (PLAYABLE_BYTES_PER_SEC > 0) return PLAYABLE_BYTES_PER_SEC;
+  const text = labelOf(stream);
+  if (/\b(2160p|4k)\b/i.test(text)) return 4000000;
+  if (/\b1080p\b/i.test(text)) return 1200000;
+  if (/\b720p\b/i.test(text)) return 800000;
+  return 400000;
+}
+
 async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
   let order = orderUnsorted;
   // How many candidates this call is allowed to load. Every probe leaves a
@@ -911,6 +924,7 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
   // is the bug this guard exists for. Kept only for a title where nothing else
   // answers.
   let fallback = null;
+  let slowest = null;
   while (Date.now() < deadline && failed.size < loaded.length) {
     await new Promise((resolve) => setTimeout(resolve, 250));
     if (failed.size >= loaded.length) break;
@@ -929,8 +943,12 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
         (most, wire) => Math.max(most, Number(wire.downSpeed || 0)),
         0,
       );
-      if (peers > 0 && rate >= PLAYABLE_BYTES_PER_SEC) {
+      if (peers > 0 && rate >= neededRate(list[item.at])) {
         if (!best || rate > best.rate) best = { ...item, peers, rate };
+      } else if (peers > 0) {
+        // Too slow to play without stalling, but it is still the fastest thing
+        // available if nothing clears the floor.
+        if (!slowest || rate > slowest.rate) slowest = { ...item, peers, rate };
       }
     }
     // The rate is the swarm's, not this file's: a season pack can have fast
@@ -981,6 +999,11 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
     }
   }
   close();
+  if (slowest) {
+    const want = Math.round(neededRate(list[slowest.at]) / 1000);
+    console.log(`nothing reaches ${want} kB/s for ${id || 'title'}; using the fastest at ${Math.round(slowest.rate / 1000)} kB/s`);
+    return slowest;
+  }
   if (fallback) {
     console.log(`only undecodable video for ${id || 'title'} (${fallback.codec}); using it`);
     return { ...fallback, peers: 0, rate: 0 };
