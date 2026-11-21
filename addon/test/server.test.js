@@ -103,8 +103,17 @@ test('unit helpers: decodeId, resolveEngineBase, requestPublicBase, rank', () =>
   assert.ok(mod.better(h264, truehd) < 0, 'at equal quality and swarm the clear audio wins');
   const truehdBig = { name: 'T 1080p', title: 'Show.1080p.TrueHD', description: '👥 80', infoHash: 'd'.repeat(40) };
   assert.ok(mod.better(h264, truehdBig) > 0, 'a much larger swarm outranks the audio codec');
-  const lower = { name: 'T 720p', title: 'Show.720p.HDTV.H.264.DDP5.1', description: '👥 200', infoHash: 'e'.repeat(40) };
-  assert.ok(mod.better(h264, lower) < 0, '1080p outranks 720p however many peers the rip has');
+  // Swarm before size: a 2160p with four peers is a black screen with a spinner,
+  // a 1080p with forty-five starts in a second, and a 720p with two hundred beats
+  // a lonely 1080p. Size only decides between equally seeded sources.
+  const lonely4k = { name: 'T 2160p', title: 'Show.2160p.WEB-DL.H.264.DDP5.1', description: '👥 4', infoHash: 'f'.repeat(40) };
+  assert.ok(mod.better(h264, lonely4k) < 0, 'a well seeded 1080p outranks a lonely 2160p');
+  const healthy4k = { name: 'T 2160p', title: 'Show.2160p.WEB-DL.H.264.DDP5.1', description: '👥 45', infoHash: 'g'.repeat(40) };
+  assert.ok(mod.better(healthy4k, h264) < 0, 'a 2160p seeded like the 1080p wins');
+  const busy720 = { name: 'T 720p', title: 'Show.720p.HDTV.H.264.DDP5.1', description: '👥 200', infoHash: 'e'.repeat(40) };
+  assert.ok(mod.better(busy720, h264) < 0, 'a far bigger swarm beats one step of resolution');
+  const same768 = { name: 'T 1080p', title: 'Show.1080p.HDTV.H.264.DDP5.1', description: '👥 20', infoHash: 'h'.repeat(40) };
+  assert.ok(mod.better(same768, h264) >= 0, 'equal swarm and quality keep a stable order');
 });
 
 test('delivers follows 307 redirect and fails on 500 or insufficient bytes', async () => {
