@@ -237,18 +237,23 @@ function rank(stream, browser) {
   const clear = /(e-?ac-?3|eac3|ddp|dd\+|ac-?3|aac|opus|mp3)/i.test(text);
   const mute = !clear && /(truehd|atmos|dts[- ]?hd|dts[- ]?x|\bdts\b|flac|pcm)/i.test(text);
   const codec = codecFromLabel(labelOf(stream));
+  // Resolution first, then the swarm. Audio codec used to outrank both and it
+  // picked a 720p HDTV rip with three peers over a 1080p WEB-DL with forty-five,
+  // which is a spinner, not a preference. A playable file that streams beats a
+  // perfect file that cannot: `lonely` still outranks everything, and the codec
+  // gate below it drops AV1/HEVC outright.
   return [
     lonely,
     videoAllowed(codec) ? 0 : 1,
-    remux || heavyFile,
+    q === -1 ? 99 : q,
+    -seeders,
     mute ? 1 : 0,
-    av1,
+    remux || heavyFile,
     clear ? 0 : 1,
     heavy ? 1 : 0,
-    q === -1 ? 99 : q,
     t === -1 ? 99 : t,
+    av1,
     p2p,
-    -seeders,
   ];
 }
 
@@ -491,10 +496,23 @@ async function candidates(type, id, browser) {
       return { ...stream, episode: type === 'movie' && EPISODE.test(name) };
     })
     .sort((left, right) => Number(left.episode) - Number(right.episode))
-    .map((stream) => ({ ...stream, browser }));
-  streams.sort(better);
-  const spoken = streams.filter(englishOnly);
-  return (spoken.length ? spoken : streams).slice(0, WANT);
+    .map((stream) => ({ ...stream, browser }))
+    // A release whose own name says AV1, HEVC or VP9 is not a candidate on this
+    // panel at all: the hardware cannot decode it, so it plays black with sound
+    // or buffers forever. Demoting it was not enough - an AV1 1080p with forty
+    // seeders still outranked a lonely H.264 - so the wrong codec is dropped
+    // before ranking. A stream that names no codec stays: the first kilobytes
+    // of the file are probed at play time and decide there.
+    .filter((stream) => videoAllowed(codecFromLabel(labelOf(stream))));
+  // A torrent nobody seeds is a spinner, however good its name reads: drop it,
+  // but only while something healthy is left. A rare title whose only remaining
+  // sources are thin still has to play - "no streams found" is a worse answer
+  // than a slow one.
+  const seeded = streams.filter((stream) => !stream.infoHash || seedersOf(stream) >= MIN_SEEDERS);
+  const pool = seeded.length ? seeded : streams;
+  pool.sort(better);
+  const spoken = pool.filter(englishOnly);
+  return (spoken.length ? spoken : pool).slice(0, WANT);
 }
 
 // English subtitle tracks for a title, from OpenSubtitles v3, matched to the
@@ -1050,9 +1068,19 @@ const server = http.createServer(async (req, res) => {
         });
       }
       if (!live || !list[live.at]) {
-        console.log(`no live source for ${cacheKey} (${list.length} candidates)`);
+        // Every delivery probe failed. Answering nothing is the dead end the
+        // panel shows as a hang, so hand it the best-ranked source as a plain
+        // torrent stream and let its own engine try: a codec-gated,
+        // seeder-checked candidate is still the right answer, and this proxy is
+        // not the only way to read it.
+        const bestTop = list[0];
+        const bestLabel = `${ADDON_NAME} · ${(bestTop.name || "").replace(/^\[[^\]]*\]\s*/, "").slice(0, 28)}`;
+        console.log(`no live source for ${cacheKey} (${list.length} candidates) - handing the panel ${bestTop.infoHash || bestTop.url}`);
+        const direct = isMediaLink(bestTop)
+          ? { name: ADDON_NAME, title: bestLabel, url: bestTop.url }
+          : { name: ADDON_NAME, title: bestLabel, infoHash: bestTop.infoHash, fileIdx: await fileIndexFor(bestTop.infoHash, id) };
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
-        res.end(jsonSafe({ streams: [] }));
+        res.end(jsonSafe({ streams: [{ ...direct, behaviorHints: { notWebReady: false, bingeGroup: "aiostre-am" } }] }));
         return;
       }
       const top = list[live.at];
