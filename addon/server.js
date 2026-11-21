@@ -192,6 +192,54 @@ function codecFromBytes(head) {
   return texts[0] || null;
 }
 
+const AUDIO_MARKERS = [
+  ["aac", ["A_AAC"]],
+  ["opus", ["A_OPUS"]],
+  ["mp3", ["A_MPEG/L3"]],
+  ["eac3", ["A_EAC3"]],
+  ["ac3", ["A_AC3"]],
+  ["dts", ["A_DTS"]],
+  ["truehd", ["A_TRUEHD"]],
+  ["flac", ["A_FLAC"]],
+];
+
+// The picture codec is not the only way a stream fails: a file carrying only
+// DTS, TrueHD or FLAC plays a picture and no sound, which is the same broken
+// experience as a black screen. The container names its audio track in the first
+// kilobytes, so the same sniff that settles the video codec settles this.
+function audioFromBytes(head) {
+  if (!head || head.length < 64) return null;
+  for (const [codec, marks] of AUDIO_MARKERS) {
+    for (const mark of marks) {
+      if (head.indexOf(mark) !== -1) return codec;
+    }
+  }
+  return null;
+}
+
+// Every Fire TV here drives the TV's own speakers over plain HDMI: AAC always
+// decodes in software, Opus/MP3 usually do, AC3/EAC3 only with the panel's
+// passthrough path up, and DTS/TrueHD/FLAC never. Silence is a failure, so the
+// audible tracks come first and the silent-only ones are a last resort.
+const SILENT_AUDIO = new Set(["dts", "truehd", "flac"]);
+
+function audioAllowed(audio) {
+  return !audio || !SILENT_AUDIO.has(audio);
+}
+
+function audioTier(audio) {
+  if (audio === "aac" || audio === "opus" || audio === "mp3") return 0;
+  if (audio === "ac3" || audio === "eac3") return 1;
+  if (!audio) return 2;
+  return 3;
+}
+
+function pickAudible(rows) {
+  const audible = rows.filter((row) => audioAllowed(row.audio));
+  const pool = audible.length ? audible : rows;
+  return [...pool].sort((left, right) => audioTier(left.audio) - audioTier(right.audio));
+}
+
 function codecFromLabel(text) {
   const line = String(text || '');
   if (/\b(x265|h\.?265|hevc)\b/i.test(line)) return 'hevc';
@@ -199,6 +247,19 @@ function codecFromLabel(text) {
   if (/\bvp9\b/i.test(line)) return 'vp9';
   if (/\b(x264|h\.?264|avc)\b/i.test(line)) return 'h264';
   return null;
+}
+
+
+// 0 = not a stereo universal codec (5.1 AAC is as silent here as AC3), 1 = unnamed,
+// 2 = explicitly AAC/MP3/Opus stereo. Ranking uses the number.
+function stereoAudio(text) {
+  const line = String(text || "");
+  const surround = /\b(5[.\s]?1|6[.\s]?ch|7[.\s]?1|dts|ac-?3|e-?ac-?3|eac3|ddp|dd\+|truehd|atmos|flac)\b/i.test(line);
+  const universal = /\b(aac|mp3|opus|vorbis)\b/i.test(line);
+  const stereo = /\b(2[.\s]?0|stereo|2ch|2\s*ch)\b/i.test(line);
+  if (universal && stereo && !surround) return 2;
+  if (universal && !surround) return 1;
+  return 0;
 }
 
 function labelOf(stream) {
@@ -256,17 +317,23 @@ function rank(stream, browser) {
   return [
     lonely,
     videoAllowed(codec) ? 0 : 1,
+    stereoAudio(text) === 2 ? 0 : 1,
+    // A link that plays from its first byte beats a swarm that has to be found
+    // first, then a file small enough to fill the buffer before the panel gives
+    // up, then the size of the swarm. Size moved above raw seeders on purpose:
+    // a 20 GB remux with forty peers still stalls a Fire TV that has to pull
+    // the whole thing itself, while a 2 GB WEB-DL with a dozen starts at once.
+    p2p,
+    remux || heavyFile,
     -seeders,
     uhdHealthy,
     q === -1 ? 99 : q,
     mute ? 1 : 0,
     universal ? 0 : 1,
-    remux || heavyFile,
     clear ? 0 : 1,
     heavy ? 1 : 0,
     t === -1 ? 99 : t,
     av1,
-    p2p,
   ];
 }
 
@@ -516,7 +583,23 @@ async function candidates(type, id, browser) {
     // seeders still outranked a lonely H.264 - so the wrong codec is dropped
     // before ranking. A stream that names no codec stays: the first kilobytes
     // of the file are probed at play time and decide there.
-    .filter((stream) => videoAllowed(codecFromLabel(labelOf(stream))));
+    .filter((stream) => videoAllowed(codecFromLabel(labelOf(stream))))
+    // The panel has no working Dolby path at all: AC3 and 5.1 render silence.
+    // A source is only a candidate when it NAMES a stereo-capable universal
+    // audio codec (AAC/MP3/Opus) and does not name 5.1/6-channel. Anything the
+    // release name does not state is not guessed at - the owner hears silence
+    // once and it is a bug, so an unnamed source ranks behind every named one.
+    // An audio track nobody names is not a reason to drop a source: the release
+    // name is a hint, not metadata. Only a stream that NAMES a codec this panel
+    // renders as silence (DTS, TrueHD, Atmos, FLAC, 5.1/7.1 with no AAC) is
+    // removed; everything else joins the chain below every named-stereo source.
+    .filter((stream) => {
+      const text = labelOf(stream);
+      if (stereoAudio(text) !== 0) return true;
+      const universal = /(aac|mp3|opus|vorbis)/i.test(text);
+      const silentOnly = /(truehd|atmos|dts|flac|5[.\s]?1|6[.\s]?ch|7[.\s]?1)/i.test(text);
+      return !(silentOnly && !universal);
+    });
   // A torrent nobody seeds is a spinner, however good its name reads: drop it,
   // but only while something healthy is left. A rare title whose only remaining
   // sources are thin still has to play - "no streams found" is a worse answer
@@ -871,11 +954,12 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
           // "lower quality", it is a stream with no picture, so it is skipped
           // as dead and the loop walks to one that has a picture.
           const codec = codecFromBytes(head) || codecFromLabel(labelOf(list[item.at]));
-          return { ...item, target: verifyUrl, codec };
+          const audio = audioFromBytes(head);
+          return { ...item, target: verifyUrl, codec, audio };
         }),
       );
       const decodable = race.filter(Boolean).filter((row) => videoAllowed(row.codec));
-      const winner = decodable[0];
+      const winner = pickAudible(decodable)[0];
       if (winner) {
         close();
         const row = (stats && stats[winner.hash]) || {};
@@ -915,12 +999,14 @@ async function firstLiveHttp(list) {
       const head = await headBytes(stream.url, Math.max(PROBE_MS, 4000));
       if (!head) return null;
       const codec = codecFromBytes(head) || codecFromLabel(labelOf(stream));
-      return { at, hash: null, target: stream.url, peers: 0, rate: 0, codec };
+      const audio = audioFromBytes(head);
+      return { at, hash: null, target: stream.url, peers: 0, rate: 0, codec, audio };
     }),
   );
   const rows = race.filter(Boolean);
   const decodable = rows.filter((row) => videoAllowed(row.codec));
-  return decodable[0] || rows[0] || null;
+  const audible = pickAudible(decodable);
+  return audible[0] || decodable[0] || rows[0] || null;
 }
 
 function readStats() {
