@@ -97,8 +97,14 @@ test('unit helpers: decodeId, resolveEngineBase, requestPublicBase, rank', () =>
   const h264 = { name: 'T 1080p', title: 'Show.1080p.BluRay.H.264.DDP5.1', description: '👥 20', infoHash: 'b'.repeat(40) };
   assert.ok(mod.better(h264, av1) < 0, 'H264 must outrank AV1 for Fire TV');
 
-  const truehd = { name: 'T 1080p', title: 'Show.1080p.TrueHD', description: '👥 80', infoHash: 'c'.repeat(40) };
-  assert.ok(mod.better(h264, truehd) < 0, 'DDP must outrank TrueHD');
+  // The panel cares about a picture that decodes and a swarm that answers before
+  // it cares about the audio track: quality, then seeders, then audio.
+  const truehd = { name: 'T 1080p', title: 'Show.1080p.TrueHD', description: '👥 20', infoHash: 'c'.repeat(40) };
+  assert.ok(mod.better(h264, truehd) < 0, 'at equal quality and swarm the clear audio wins');
+  const truehdBig = { name: 'T 1080p', title: 'Show.1080p.TrueHD', description: '👥 80', infoHash: 'd'.repeat(40) };
+  assert.ok(mod.better(h264, truehdBig) > 0, 'a much larger swarm outranks the audio codec');
+  const lower = { name: 'T 720p', title: 'Show.720p.HDTV.H.264.DDP5.1', description: '👥 200', infoHash: 'e'.repeat(40) };
+  assert.ok(mod.better(h264, lower) < 0, '1080p outranks 720p however many peers the rip has');
 });
 
 test('delivers follows 307 redirect and fails on 500 or insufficient bytes', async () => {
@@ -161,7 +167,7 @@ test('/healthz reports ok=true when healthy and 503 when streaming server return
   );
 });
 
-test('/stream fails fast with empty streams (no hang/unverified fallback) when streaming returns 500 or dead swarm', async () => {
+test('/stream hands the panel the best-ranked source when every delivery probe fails', async () => {
   const hashDead = '1'.repeat(40);
   await withMockStack(
     {
@@ -189,8 +195,12 @@ test('/stream fails fast with empty streams (no hang/unverified fallback) when s
       const res = await fetchJson(`${addonUrl}/stream/series/tt2193021%3A1%3A4.json`);
       const elapsed = Date.now() - started;
       assert.equal(res.status, 200);
-      assert.deepEqual(res.body.streams, []);
-      assert.ok(elapsed < 1000, `Expected fast failure < 1000ms, got ${elapsed}ms`);
+      // A dead engine is not an empty answer any more: the top-ranked, codec
+      // gated source goes to the panel so its own engine can try, and the
+      // request still returns fast.
+      assert.equal(res.body.streams.length, 1);
+      assert.equal(res.body.streams[0].infoHash, hashDead);
+      assert.ok(elapsed < 1500, `Expected a fast answer, got ${elapsed}ms`);
     },
   );
 });
