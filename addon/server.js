@@ -1198,9 +1198,18 @@ const server = http.createServer(async (req, res) => {
         const bestTop = list[0];
         const bestLabel = `${ADDON_NAME} · ${(bestTop.name || "").replace(/^\[[^\]]*\]\s*/, "").slice(0, 28)}`;
         console.log(`no live source for ${cacheKey} (${list.length} candidates) - handing the panel ${bestTop.infoHash || bestTop.url}`);
+        // A raw infoHash here makes the panel's own engine join the swarm from
+        // the house's public IP, outside the VPN that every other request on
+        // this box goes through. The stream is routed through this engine
+        // instead, even when it has not gone live yet: the player warming it is
+        // also what turns it live.
         const direct = isMediaLink(bestTop)
           ? { name: ADDON_NAME, title: bestLabel, url: bestTop.url }
-          : { name: ADDON_NAME, title: bestLabel, infoHash: bestTop.infoHash, fileIdx: await fileIndexFor(bestTop.infoHash, id) };
+          : {
+            name: ADDON_NAME,
+            title: bestLabel,
+            url: `${resolveEngineBase()}/${bestTop.infoHash}/${await fileIndexFor(bestTop.infoHash, id)}`,
+          };
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
         res.end(jsonSafe({ streams: [{ ...direct, behaviorHints: { notWebReady: false, bingeGroup: "aiostre-am" } }] }));
         return;
