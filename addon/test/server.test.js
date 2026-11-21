@@ -210,10 +210,13 @@ test('/stream hands the panel the best-ranked source when every delivery probe f
       const elapsed = Date.now() - started;
       assert.equal(res.status, 200);
       // A dead engine is not an empty answer any more: the top-ranked, codec
-      // gated source goes to the panel so its own engine can try, and the
-      // request still returns fast.
+      // gated source goes to the panel, and the request still returns fast.
+      // It goes as an ENGINE URL, never as a raw infoHash: an infoHash makes the
+      // panel's own engine join the swarm from the house's public IP, outside the
+      // WireGuard tunnel that every other byte of this stack leaves through.
       assert.equal(res.body.streams.length, 1);
-      assert.equal(res.body.streams[0].infoHash, hashDead);
+      assert.equal(res.body.streams[0].infoHash, undefined);
+      assert.match(res.body.streams[0].url, new RegExp(`${hashDead}/\\d+$`));
       assert.ok(elapsed < 1500, `Expected a fast answer, got ${elapsed}ms`);
     },
   );
