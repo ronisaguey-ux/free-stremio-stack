@@ -234,6 +234,11 @@ function rank(stream, browser) {
   const gb = Number((/([\d.]+)\s*GB/i.exec(text) || [])[1] || 0);
   const heavyFile = gb >= 4 ? 1 : 0;
   const av1 = /\bav1\b/i.test(text) ? 1 : 0;
+  // The panel plays Dolby only when something downstream decodes it; with plain
+  // HDMI-to-TV it renders silence on an AC3 track. AAC/MP3/Opus always decode in
+  // software, so they come first, AC3/DD next (they work with passthrough on),
+  // and the codecs that need a receiver last.
+  const universal = /(aac|mp3|opus|vorbis)/i.test(text);
   const clear = /(e-?ac-?3|eac3|ddp|dd\+|ac-?3|aac|opus|mp3)/i.test(text);
   const mute = !clear && /(truehd|atmos|dts[- ]?hd|dts[- ]?x|\bdts\b|flac|pcm)/i.test(text);
   const codec = codecFromLabel(labelOf(stream));
@@ -255,6 +260,7 @@ function rank(stream, browser) {
     uhdHealthy,
     q === -1 ? 99 : q,
     mute ? 1 : 0,
+    universal ? 0 : 1,
     remux || heavyFile,
     clear ? 0 : 1,
     heavy ? 1 : 0,
