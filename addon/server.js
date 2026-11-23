@@ -1178,6 +1178,16 @@ function commitSource(hash, idx, id, needMbps) {
   });
 }
 
+// Containers ExoPlayer cannot open on this TV. An AVI reached the player and
+// media3's AviExtractor threw IllegalArgumentException on its own header
+// (ListChunk.setLimit), which the panel shows as "illegal argument exception".
+// The swarm's throughput was fine; the file was the wrong shape.
+const UNPLAYABLE_CONTAINER = /\.(avi|wmv|flv|mpg|mpeg|vob|rm|rmvb|3gp)$/i;
+
+function playableContainer(name) {
+  return !UNPLAYABLE_CONTAINER.test(String(name || ""));
+}
+
 function probeSwarm(hashes, indexes, id) {
   return new Promise((resolve) => {
     const query = `?ms=14000&hashes=${hashes.join(",")}&idx=${indexes.join(",")}&id=${encodeURIComponent(id || "")}`;
@@ -1293,10 +1303,21 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const subtitleMatch = path.match(/^\/subtitles\/([^/]+)\/(.+)\.json$/);
+    const subtitleMatch = path.match(/^\/subtitles\/([^/]+)\/(.+?)(?:\.json)?$/);
     if (subtitleMatch) {
       const subType = subtitleMatch[1];
-      const subId = decodeId(subtitleMatch[2]);
+      const rawSubId = decodeId(subtitleMatch[2]);
+      // When a stream carries no behaviorHints.filename the panel builds the
+      // subtitle id out of the stream itself, so it arrives as
+      // `tt4975856:2:12/filename=24?tr=http://...`. Only the leading
+      // imdb id and its season/episode are the video id; the rest is noise.
+      const subParts = /(tt\d{4,})(?::(\d+):(\d+))?/.exec(rawSubId);
+      const subId = subParts
+        ? (subParts[2] ? `${subParts[1]}:${subParts[2]}:${subParts[3]}` : subParts[1])
+        : rawSubId;
+      if (subId !== rawSubId) {
+        console.log(`subtitle id cleaned: ${JSON.stringify(rawSubId.slice(0, 60))} -> ${subId}`);
+      }
       const picked = streamChoice.get(`${subType}:${subId}`);
       const release = picked ? [picked.releaseName, picked.releaseTitle].filter(Boolean).join(' ') : '';
       const cacheKey = `${subType}:${subId}:${release}`;
@@ -1318,7 +1339,13 @@ const server = http.createServer(async (req, res) => {
       const id = decodeId(streamMatch[2]);
       const uaStream = String(req.headers['user-agent'] || '');
       const isBrowser = /Chrome|Mozilla|Safari|Firefox/i.test(uaStream);
-      const list = await candidates(type, id, isBrowser);
+      const rawList = await candidates(type, id, isBrowser);
+      // Drop a candidate that names an AVI before it is ever warmed: a torrent
+      // that only holds an AVI is one the player cannot decode.
+      const list = rawList.filter((row) => playableContainer((row.behaviorHints && row.behaviorHints.filename) || row.title || ""));
+      if (rawList.length !== list.length) {
+        console.log(`${type}:${id}: dropped ${rawList.length - list.length} candidate(s) whose container the player cannot open`);
+      }
       if (!list.length) {
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
         res.end(jsonSafe({ streams: [] }));
@@ -1360,6 +1387,9 @@ const server = http.createServer(async (req, res) => {
         const ranked = rows
           .map((row, k) => {
             if (!row || !row.ok || !row.length) return null;
+            // The real file name comes from the torrent itself, which is the
+            // only place that knows an AVI is an AVI.
+            if (!playableContainer(row.name)) return null;
             const needed = (row.length * 8) / (assumedSeconds * 1e6);
             return { ...picks[k], headroom: row.mbps / Math.max(0.25, needed), mbps: row.mbps, needed, length: row.length, idx: row.idx };
           })
@@ -1374,12 +1404,12 @@ const server = http.createServer(async (req, res) => {
           const fastEnough = committed.mbps >= need * 1.2;
           console.log(`sidecar commit ${cacheKey}: ${candidate.hash.slice(0, 8)} idx=${committed.idx} buffered=${(committed.buffered / 1048576).toFixed(1)}MB of ${(committed.wanted / 1048576).toFixed(0)}MB at ${committed.mbps}Mbps needs ${need.toFixed(2)}Mbps -> ${bufferedEnough || fastEnough ? "take" : "skip"}`);
           if (bufferedEnough || fastEnough) {
-            chosen = { ...candidate, idx: committed.idx, mbps: committed.mbps || candidate.mbps, needed: need };
+            chosen = { ...candidate, idx: committed.idx, mbps: committed.mbps || candidate.mbps, needed: need, filename: committed.name, size: committed.length };
             break;
           }
         }
         if (chosen) {
-          live = { at: chosen.at, hash: chosen.hash, peers: 1, rate: chosen.mbps, cachedAt: Date.now() };
+          live = { at: chosen.at, hash: chosen.hash, peers: 1, rate: chosen.mbps, cachedAt: Date.now(), filename: chosen.filename, size: chosen.size };
           streamChoice.set(cacheKey, live);
           console.log(`sidecar ready ${cacheKey}: ${chosen.hash.slice(0, 8)} ${chosen.mbps}Mbps for ${chosen.needed.toFixed(2)}Mbps needed, idx=${chosen.idx}`);
         } else {
@@ -1477,7 +1507,14 @@ console.log(`no live source for ${cacheKey} (${list.length} candidates) - handin
         name: ADDON_NAME,
         title: label,
         url: hash ? withTrackers(`${engine}/${hash}/${fileAt}`, top) : (live.target || `${pubBase}/play/${type}/${encodeURIComponent(id)}`),
-        behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
+        behaviorHints: {
+          notWebReady: false,
+          bingeGroup: 'aiostre-am',
+          // A named file is what keeps the panel from inventing a video id out
+          // of the URL, which is what broke subtitles.
+          ...((live && live.filename) ? { filename: live.filename } : {}),
+          ...((live && live.size) ? { videoSize: live.size } : {}),
+        },
       }];
       if (hash) keepWarm(hash, fileAt);
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
