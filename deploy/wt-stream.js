@@ -216,16 +216,36 @@ async function handleProbe(res, url) {
     selectOnly(torrent, indexFor(torrent, k));
   });
   await new Promise((resolve) => setTimeout(resolve, 800));
-  const before = loaded.map((torrent) => (torrent ? Number(torrent.downloaded || 0) : 0));
-  const windowMs = Math.max(3000, Math.min(6000, budget - (Date.now() - began)));
+  // Per-interval deltas, then the median. A torrent that has just been added
+  // reports one burst of already-counted bytes, and an average over the window
+  // turns that burst into a throughput no pipe could carry — the gate then
+  // trusts a source that stalls. The median ignores the burst.
+  const samples = loaded.map(() => []);
+  let last = loaded.map((torrent) => (torrent ? Number(torrent.downloaded || 0) : 0));
+  const windowMs = Math.max(4000, Math.min(8000, budget - (Date.now() - began)));
   const sampleAt = Date.now();
-  await new Promise((resolve) => setTimeout(resolve, windowMs));
+  const tick = 500;
+  const ticks = Math.max(2, Math.floor(windowMs / tick));
+  for (let step = 0; step < ticks; step += 1) {
+    await new Promise((resolve) => setTimeout(resolve, tick));
+    loaded.forEach((torrent, k) => {
+      if (!torrent) return;
+      const now = Number(torrent.downloaded || 0);
+      samples[k].push(Math.max(0, now - last[k]));
+      last[k] = now;
+    });
+  }
   const seconds = Math.max(1, (Date.now() - sampleAt) / 1000);
+  const median = (values) => {
+    if (!values.length) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  };
   const rows = loaded.map((torrent, k) => {
     if (!torrent) return { hash: hashes[k], ok: false, mbps: 0 };
     const index = indexFor(torrent, k);
     const file = torrent.files[index];
-    const delta = Math.max(0, Number(torrent.downloaded || 0) - before[k]);
+    const delta = median(samples[k]) * (1000 / tick);
     return {
       hash: hashes[k],
       ok: true,
