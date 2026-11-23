@@ -1154,9 +1154,17 @@ async function firstLiveHttp(list) {
   return audible[0] || decodable[0] || rows[0] || null;
 }
 
-function warmOne(hash, ms) {
+// Ask the sidecar to warm a batch of candidates and report what each swarm
+// really delivers. The addon then refuses a source whose measured throughput
+// cannot feed the bitrate the file needs: that mismatch is the stream that
+// plays for five seconds and stalls.
+// Commit to the winning source: the sidecar drops every other torrent, selects
+// only this episode, and buffers a cushion before the player's first request.
+function commitSource(hash, idx, id) {
   return new Promise((resolve) => {
-    const req = http.get(`${STREAMING}/warm/${hash}?ms=${ms}`, { timeout: ms + 3000 }, (res) => {
+    const index = Number.isInteger(idx) ? String(idx) : "";
+    const query = `?ms=25000&mb=12&idx=${index}&id=${encodeURIComponent(id || "")}`;
+    const req = http.get(`${STREAMING}/commit/${hash}${query}`, { timeout: 32000 }, (res) => {
       let body = "";
       res.setEncoding("utf8");
       res.on("data", (chunk) => { body += chunk; });
@@ -1169,46 +1177,19 @@ function warmOne(hash, ms) {
   });
 }
 
-// Warm the top candidates at once and answer with the one that actually has a
-// peer. A cold torrent takes ~15 s before its first byte, and handing the panel
-// that URL is exactly the spinner the owner calls a hang.
-// Answers with the first candidate that has a peer, not the last one to reply:
-// waiting for every probe is what turned a two-second warm into eleven seconds
-// of spinner. The losing candidates keep warming in the sidecar anyway, so the
-// next request for this title is instant.
-function warmBest(items, ms) {
-  const budget = Number(ms) || 12000;
-  const hashes = items.map((item) => (item && item.infoHash ? String(item.infoHash).toLowerCase() : null));
+function probeSwarm(hashes, indexes, id) {
   return new Promise((resolve) => {
-    let done = false;
-    let best = null;
-    let remaining = hashes.filter(Boolean).length;
-    if (!remaining) {
-      resolve(null);
-      return;
-    }
-    const finish = (value) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      resolve(value);
-    };
-    const timer = setTimeout(() => finish(best), budget);
-    hashes.forEach((hash, i) => {
-      if (!hash) return;
-      warmOne(hash, budget).then((r) => {
-        remaining -= 1;
-        if (r && r.ok && r.peers > 0) {
-          if (!best || r.peers > best.peers) best = { at: i, peers: r.peers, hash };
-          finish(best);
-        } else if (!remaining) {
-          finish(best);
-        }
-      }).catch(() => {
-        remaining -= 1;
-        if (!remaining) finish(best);
+    const query = `?ms=14000&hashes=${hashes.join(",")}&idx=${indexes.join(",")}&id=${encodeURIComponent(id || "")}`;
+    const req = http.get(`${STREAMING}/probe${query}`, { timeout: 26000 }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        try { resolve(JSON.parse(body)); } catch (_) { resolve(null); }
       });
     });
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("error", () => resolve(null));
   });
 }
 
@@ -1357,13 +1338,40 @@ const server = http.createServer(async (req, res) => {
         }
       }
       if (!live && String(process.env.STREAMING_URL || "").includes(":11471")) {
-        const warmed = await warmBest(list.slice(0, 6), 10000).catch(() => null);
-        if (warmed && list[warmed.at]) {
-          live = { at: warmed.at, hash: warmed.hash, peers: warmed.peers, rate: 0, cachedAt: Date.now() };
+        const picks = [];
+        for (let step = 0; step < Math.min(list.length, 6); step += 1) {
+          const row = list[step];
+          if (!row || !row.infoHash) continue;
+          picks.push({ at: step, hash: String(row.infoHash).toLowerCase(), idx: Number.isInteger(row.fileIdx) ? row.fileIdx : "" });
+        }
+        const probedSwarm = picks.length
+          ? await probeSwarm(picks.map((pick) => pick.hash), picks.map((pick) => pick.idx), id).catch(() => null)
+          : null;
+        const rows = (probedSwarm && probedSwarm.rows) || [];
+        // An episode runs 40-50 minutes and a film about ninety: close enough to
+        // turn a file size into the bitrate the player will demand of the swarm.
+        const assumedSeconds = type === "series" ? 2700 : 6600;
+        let chosen = null;
+        rows.forEach((row, k) => {
+          if (!row || !row.ok || !row.length) return;
+          const needed = (row.length * 8) / (assumedSeconds * 1e6);
+          const headroom = row.mbps / Math.max(0.25, needed);
+          const scored = { ...picks[k], headroom, mbps: row.mbps, needed, length: row.length, idx: row.idx };
+          if (!chosen || scored.headroom > chosen.headroom) chosen = scored;
+        });
+        if (chosen) {
+          const committed = await commitSource(chosen.hash, chosen.idx, id).catch(() => null);
+          if (committed && committed.ok) {
+            chosen.idx = committed.idx;
+            chosen.mbps = committed.mbps || chosen.mbps;
+            console.log(`sidecar commit ${cacheKey}: ${chosen.hash.slice(0, 8)} idx=${committed.idx} buffered=${(committed.buffered / 1048576).toFixed(1)}MB of ${(committed.wanted / 1048576).toFixed(0)}MB in ${committed.waitedMs}ms at ${committed.mbps}Mbps`);
+          }
+          live = { at: chosen.at, hash: chosen.hash, peers: 1, rate: chosen.mbps, cachedAt: Date.now() };
           streamChoice.set(cacheKey, live);
-          console.log(`sidecar warm ${cacheKey}: peers=${warmed.peers} ${warmed.hash}`);
+          const verdict = chosen.headroom >= 1.2 ? "fits" : "tight";
+          console.log(`sidecar probe ${cacheKey}: ${chosen.hash.slice(0, 8)} delivers ${chosen.mbps}Mbps, needs ${chosen.needed.toFixed(2)}Mbps (x${chosen.headroom.toFixed(2)} ${verdict}) idx=${chosen.idx}`);
         } else {
-          console.log(`sidecar warm ${cacheKey}: no peer among 6 of ${list.length}`);
+          console.log(`sidecar probe ${cacheKey}: no candidate answered of ${list.length}`);
         }
       }
       if (!live) {
