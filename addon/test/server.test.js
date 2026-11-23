@@ -181,7 +181,7 @@ test('/healthz reports ok=true when healthy and 503 when streaming server return
   );
 });
 
-test('/stream hands the panel the best-ranked source when every delivery probe fails', async () => {
+test('/stream answers empty instead of a stream a dead engine cannot deliver', async () => {
   const hashDead = '1'.repeat(40);
   await withMockStack(
     {
@@ -209,14 +209,11 @@ test('/stream hands the panel the best-ranked source when every delivery probe f
       const res = await fetchJson(`${addonUrl}/stream/series/tt2193021%3A1%3A4.json`);
       const elapsed = Date.now() - started;
       assert.equal(res.status, 200);
-      // A dead engine is not an empty answer any more: the top-ranked, codec
-      // gated source goes to the panel, and the request still returns fast.
-      // It goes as an ENGINE URL, never as a raw infoHash: an infoHash makes the
-      // panel's own engine join the swarm from the house's public IP, outside the
-      // WireGuard tunnel that every other byte of this stack leaves through.
-      assert.equal(res.body.streams.length, 1);
-      assert.equal(res.body.streams[0].infoHash, undefined);
-      assert.match(res.body.streams[0].url, new RegExp(`${hashDead}/\\d+$`));
+      // A source the engine holds with zero peers is the panel's "hangs
+      // forever": it joins nothing, serves no byte, and the player spins on a
+      // socket that will never answer. The empty list renders at once. The
+      // sidecar backend, which does find peers, is handed the source instead.
+      assert.equal(res.body.streams.length, 0);
       assert.ok(elapsed < 1500, `Expected a fast answer, got ${elapsed}ms`);
     },
   );
@@ -278,13 +275,20 @@ test('/stream returns verified winning torrent with resolved series episode file
       const res = await fetchJson(`${addonUrl}/stream/series/tt2193021%3A1%3A4.json`);
       assert.equal(res.status, 200);
       assert.equal(res.body.streams.length, 1);
-      assert.equal(res.body.streams[0].url, `http://192.168.86.37:11470/${bestHash}/1`);
+      // Every play URL leaves with the tracker list attached: a bare
+      // /<hash>/<file> carries none, so the engine only sees the peers it
+      // stumbles on.
+      assert.ok(
+        res.body.streams[0].url.startsWith(`http://192.168.86.37:11470/${bestHash}/1`),
+        res.body.streams[0].url,
+      );
+      assert.match(res.body.streams[0].url, /\?tr=udp%3A%2F%2Ftracker\.opentrackr\.org/);
 
       // Second consecutive request hits streamChoice cache and must still return the winner (never [])
       const res2 = await fetchJson(`${addonUrl}/stream/series/tt2193021%3A1%3A4.json`);
       assert.equal(res2.status, 200);
       assert.equal(res2.body.streams.length, 1);
-      assert.equal(res2.body.streams[0].url, `http://192.168.86.37:11470/${bestHash}/1`);
+      assert.ok(res2.body.streams[0].url.startsWith(`http://192.168.86.37:11470/${bestHash}/1`), res2.body.streams[0].url);
     },
   );
 });

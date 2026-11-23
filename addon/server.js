@@ -17,6 +17,36 @@ const PORT = Number(process.env.PORT || 3819);
 const PUBLIC = process.env.PUBLIC_URL || 'http://192.168.86.49:3819';
 const HUB = process.env.HUB_URL || '';           // .../manifest.json
 const STREAMING = (process.env.STREAMING_URL || 'http://127.0.0.1:11470').replace(/\/$/, '');
+// Public trackers. Torrentio often hands over a bare infohash with no
+// trackers at all, and a swarm with no tracker is whatever peers the engine
+// stumbles on: 6 peers at 550 kB/s, which is the freezing Arrow reported.
+const DEFAULT_TRACKERS = [
+  "udp://tracker.opentrackr.org:1337/announce",
+  "udp://open.stealth.si:80/announce",
+  "https://tracker.gbitt.info:443/announce",
+  "https://tracker2.dler.org:443/announce",
+  "https://opentracker.i2p.rocks:443/announce",
+  "https://tracker.tamersunion.org:443/announce",
+  "udp://tracker.torrent.eu.org:451/announce",
+  "udp://tracker.openbittorrent.com:6969/announce",
+  "udp://exodus.desync.com:6969/announce",
+  "udp://tracker.moeking.me:6969/announce",
+  "udp://explodie.org:6969/announce",
+  "udp://tracker.dler.org:6969/announce",
+];
+
+
+// A bare `/<hash>/<file>` URL carries no tracker, so the engine only sees the
+// peers it stumbles on. Every play URL leaves here with a tracker list.
+function withTrackers(url, stream) {
+  if (!url || url.includes("?tr=")) return url;
+  const own = ((stream && stream.sources) || [])
+    .filter((source) => typeof source === "string" && source.startsWith("tracker:"))
+    .map((source) => source.slice(8));
+  const list = own.length ? own : DEFAULT_TRACKERS;
+  return list.length ? `${url}?tr=${encodeURIComponent(list.join(","))}` : url;
+}
+
 const STREAMING_PUBLIC = (process.env.STREAMING_PUBLIC_URL || '').replace(/\/$/, '');
 // A dead swarm answers nothing at all: 1.8s is long enough to know a torrent
 // is not going to start and short enough that four of them in parallel stay
@@ -434,6 +464,35 @@ function delivers(url, need, within, redirects = 3) {
 // panel can show a picture.
 const CODEC_SNIFF_BYTES = 262144;
 
+
+// What the player will actually get, not what the swarm claims. A torrent the
+// engine already holds serves from disk at hundreds of megabytes a second, and
+// that is the difference between a stream that freezes every ten seconds and
+// one that does not - the wire rate cannot see it.
+function deliverRate(url, within) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let got = 0;
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      const seconds = Math.max(0.25, (Date.now() - started) / 1000);
+      resolve(got / seconds);
+    };
+    const target = new URL(url);
+    const lib = target.protocol === "https:" ? https : http;
+    const req = lib.get(url, { headers: { range: "bytes=0-8388607", "user-agent": "aio-failover/1.0" } }, (res) => {
+      if (res.statusCode >= 400) { res.resume(); done(); return; }
+      res.on("data", (chunk) => { got += chunk.length; });
+      res.on("end", done);
+      res.on("error", done);
+    });
+    req.on("error", done);
+    req.setTimeout(within, () => { try { req.destroy(); } catch (_) {} done(); });
+  });
+}
+
 function headBytes(url, within, redirects = 3) {
   return new Promise((resolve) => {
     const started = Date.now();
@@ -497,7 +556,8 @@ function swarmAlive(target) {
   if (!match) return Promise.resolve(null);
   const hash = match[1].toLowerCase();
   return new Promise((resolve) => {
-    const req = http.get(`${STREAMING}/stats.json`, { timeout: 1500 }, (res) => {
+    const probe = STREAMING.includes(":11471") ? `${STREAMING}/healthz` : `${STREAMING}/stats.json`;
+    const req = http.get(probe, { timeout: 1500 }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { body += chunk; });
@@ -539,6 +599,36 @@ function alive(url, redirects = 3) {
     req.setTimeout(PROBE_MS, () => { req.destroy(); resolve(false); });
     req.on('error', () => resolve(false));
   });
+}
+
+
+// The hub is the AIOStreams addon running on the TV, and when its providers are
+// broken it answers with placeholders only ("PenguPlay authentication is
+// missing", "[x] Torrentio"). Returning an empty list there reads as "AIOSTreams
+// never loads". These public indexers are asked directly, from this box, when
+// the hub has nothing usable left.
+const FALLBACK_SOURCES = [
+  "https://peerflix.mov",
+  "https://mediafusion.elfhosted.com",
+];
+
+async function fallbackCandidates(type, id, browser) {
+  const out = [];
+  for (const base of FALLBACK_SOURCES) {
+    try {
+      const body = await get(`${base.replace(/\/$/, "")}/stream/${type}/${encodeURIComponent(id)}.json`, 12000);
+      const rows = (body && body.streams) || [];
+      for (const stream of rows) {
+        if (!stream.url && !stream.infoHash) continue;
+        if (isPlaceholder(stream)) continue;
+        // A public indexer often omits the seeder count, and seedersOf then reads 0:
+        // filtering on it here threw away every fallback source.
+        out.push({ ...stream, browser });
+      }
+      if (out.length) break;
+    } catch (_) {}
+  }
+  return out;
 }
 
 async function candidates(type, id, browser) {
@@ -608,7 +698,15 @@ async function candidates(type, id, browser) {
   const pool = seeded.length ? seeded : streams;
   pool.sort(better);
   const spoken = pool.filter(englishOnly);
-  return (spoken.length ? spoken : pool).slice(0, WANT);
+  const chosen = (spoken.length ? spoken : pool).slice(0, WANT);
+  if (chosen.length) return chosen;
+  // Nothing usable from the hub: ask the public indexers before telling the
+  // player there is nothing to play.
+  const extra = await fallbackCandidates(type, id, browser);
+  if (extra.length) {
+    console.log(`hub had nothing for ${type} ${id}; using ${extra.length} fallback source(s)`);
+  }
+  return extra.slice(0, WANT);
 }
 
 // English subtitle tracks for a title, from OpenSubtitles v3, matched to the
@@ -843,7 +941,8 @@ function playUrl(stream) {
   const trackers = (stream.sources || [])
     .filter((source) => typeof source === 'string' && source.startsWith('tracker:'))
     .map((source) => source.slice(8));
-  const query = trackers.length ? `?tr=${encodeURIComponent(trackers.join(','))}` : '';
+  const list = trackers.length ? trackers : DEFAULT_TRACKERS;
+  const query = list.length ? `?tr=${encodeURIComponent(list.join(','))}` : '';
   return `${STREAMING}/${stream.infoHash}${file}/${encodeURIComponent(name)}${query}`;
 }
 
@@ -859,10 +958,10 @@ function playUrl(stream) {
 function neededRate(stream) {
   if (PLAYABLE_BYTES_PER_SEC > 0) return PLAYABLE_BYTES_PER_SEC;
   const text = labelOf(stream);
-  if (/\b(2160p|4k)\b/i.test(text)) return 4000000;
-  if (/\b1080p\b/i.test(text)) return 1200000;
-  if (/\b720p\b/i.test(text)) return 800000;
-  return 400000;
+  if (/\b(2160p|4k)\b/i.test(text)) return 2500000;
+  if (/\b1080p\b/i.test(text)) return 800000;
+  if (/\b720p\b/i.test(text)) return 400000;
+  return 300000;
 }
 
 async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
@@ -948,7 +1047,8 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
       } else if (peers > 0) {
         // Too slow to play without stalling, but it is still the fastest thing
         // available if nothing clears the floor.
-        if (!slowest || rate > slowest.rate) slowest = { ...item, peers, rate };
+        const fit = rate / Math.max(1, neededRate(list[item.at]));
+        if (!slowest || fit > slowest.fit) slowest = { ...item, peers, rate, fit };
       }
     }
     // The rate is the swarm's, not this file's: a season pack can have fast
@@ -998,6 +1098,28 @@ async function firstLive(list, orderUnsorted, windowMs, maxProbes, id = '') {
       }
     }
   }
+  if (slowest) {
+    // Nothing cleared the floor on wire speed. Ask the engine what it can
+    // deliver instead: a cached copy serves instantly even with a cold swarm.
+    const contenders = loaded.filter((item) => !failed.has(item.hash)).slice(0, 3);
+    const rates = await Promise.all(
+      contenders.map(async (item) => {
+        let url = item.target;
+        if (!item.hasFileIdx && id) {
+          const idx = await fileIndexFor(item.hash, id);
+          url = `${STREAMING}/${item.hash}/${idx}`;
+        }
+        const rate = await deliverRate(url, 4000);
+        return { ...item, deliver: rate };
+      }),
+    );
+    rates.sort((left, right) => right.deliver - left.deliver);
+    if (rates.length && rates[0].deliver > slowest.rate) {
+      close(rates[0].hash);
+      console.log(`serving ${rates[0].hash.slice(0, 8)} at ${Math.round(rates[0].deliver / 1000)} kB/s delivered (swarm said ${Math.round(slowest.rate / 1000)})`);
+      return { ...rates[0], peers: 0, rate: rates[0].deliver };
+    }
+  }
   close();
   if (slowest) {
     const want = Math.round(neededRate(list[slowest.at]) / 1000);
@@ -1032,6 +1154,64 @@ async function firstLiveHttp(list) {
   return audible[0] || decodable[0] || rows[0] || null;
 }
 
+function warmOne(hash, ms) {
+  return new Promise((resolve) => {
+    const req = http.get(`${STREAMING}/warm/${hash}?ms=${ms}`, { timeout: ms + 3000 }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        try { resolve(JSON.parse(body)); } catch (_) { resolve(null); }
+      });
+    });
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("error", () => resolve(null));
+  });
+}
+
+// Warm the top candidates at once and answer with the one that actually has a
+// peer. A cold torrent takes ~15 s before its first byte, and handing the panel
+// that URL is exactly the spinner the owner calls a hang.
+// Answers with the first candidate that has a peer, not the last one to reply:
+// waiting for every probe is what turned a two-second warm into eleven seconds
+// of spinner. The losing candidates keep warming in the sidecar anyway, so the
+// next request for this title is instant.
+function warmBest(items, ms) {
+  const budget = Number(ms) || 12000;
+  const hashes = items.map((item) => (item && item.infoHash ? String(item.infoHash).toLowerCase() : null));
+  return new Promise((resolve) => {
+    let done = false;
+    let best = null;
+    let remaining = hashes.filter(Boolean).length;
+    if (!remaining) {
+      resolve(null);
+      return;
+    }
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(best), budget);
+    hashes.forEach((hash, i) => {
+      if (!hash) return;
+      warmOne(hash, budget).then((r) => {
+        remaining -= 1;
+        if (r && r.ok && r.peers > 0) {
+          if (!best || r.peers > best.peers) best = { at: i, peers: r.peers, hash };
+          finish(best);
+        } else if (!remaining) {
+          finish(best);
+        }
+      }).catch(() => {
+        remaining -= 1;
+        if (!remaining) finish(best);
+      });
+    });
+  });
+}
+
 function readStats() {
   return new Promise((resolve) => {
     const req = http.get(`${STREAMING}/stats.json`, { timeout: 1500 }, (res) => {
@@ -1045,7 +1225,16 @@ function readStats() {
       res.on('data', (chunk) => { body += chunk; });
       res.on('end', () => {
         try {
-          resolve(JSON.parse(body));
+          const parsed = JSON.parse(body);
+          if (parsed && Array.isArray(parsed.torrents)) {
+            const byHash = {};
+            for (const item of parsed.torrents) {
+              byHash[String(item.hash || "").toLowerCase()] = item;
+            }
+            resolve(byHash);
+          } else {
+            resolve(parsed);
+          }
         } catch (_) {
           resolve(null);
         }
@@ -1167,6 +1356,16 @@ const server = http.createServer(async (req, res) => {
           }
         }
       }
+      if (!live && String(process.env.STREAMING_URL || "").includes(":11471")) {
+        const warmed = await warmBest(list.slice(0, 6), 10000).catch(() => null);
+        if (warmed && list[warmed.at]) {
+          live = { at: warmed.at, hash: warmed.hash, peers: warmed.peers, rate: 0, cachedAt: Date.now() };
+          streamChoice.set(cacheKey, live);
+          console.log(`sidecar warm ${cacheKey}: peers=${warmed.peers} ${warmed.hash}`);
+        } else {
+          console.log(`sidecar warm ${cacheKey}: no peer among 6 of ${list.length}`);
+        }
+      }
       if (!live) {
         const probed = await firstLive(
           list,
@@ -1197,7 +1396,23 @@ const server = http.createServer(async (req, res) => {
         // not the only way to read it.
         const bestTop = list[0];
         const bestLabel = `${ADDON_NAME} · ${(bestTop.name || "").replace(/^\[[^\]]*\]\s*/, "").slice(0, 28)}`;
-        console.log(`no live source for ${cacheKey} (${list.length} candidates) - handing the panel ${bestTop.infoHash || bestTop.url}`);
+                // A stream the engine cannot deliver is the panel's "hanging forever":
+        // it joins nothing, serves no byte and the player spins. Answer with
+        // nothing instead, which the panel renders as "no streams" at once,
+        // unless the engine reports a peer for this hash.
+        if (String(process.env.STREAMING_URL || "").includes(":11471")) {
+            console.log(`no live source for ${cacheKey} (${list.length} candidates) - handing the sidecar ${bestTop.infoHash || bestTop.url}`);
+        } else {
+            const deadStats = await readStats().catch(() => null);
+            const deadPeers = Number((deadStats && bestTop.infoHash && deadStats[bestTop.infoHash] && deadStats[bestTop.infoHash].peers) || 0);
+            if (deadPeers <= 0) {
+                console.log(`no live source for ${cacheKey} (${list.length} candidates, 0 peers) - answering empty so the panel does not hang`);
+                res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+                res.end(jsonSafe({ streams: [] }));
+                return;
+            }
+        }
+console.log(`no live source for ${cacheKey} (${list.length} candidates) - handing the panel ${bestTop.infoHash || bestTop.url}`);
         // A raw infoHash here makes the panel's own engine join the swarm from
         // the house's public IP, outside the VPN that every other request on
         // this box goes through. The stream is routed through this engine
@@ -1208,7 +1423,7 @@ const server = http.createServer(async (req, res) => {
           : {
             name: ADDON_NAME,
             title: bestLabel,
-            url: `${resolveEngineBase()}/${bestTop.infoHash}/${await fileIndexFor(bestTop.infoHash, id)}`,
+            url: withTrackers(`${resolveEngineBase()}/${bestTop.infoHash}/${Number.isInteger(bestTop.fileIdx) ? bestTop.fileIdx : await fileIndexFor(bestTop.infoHash, id)}`, bestTop),
           };
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
         res.end(jsonSafe({ streams: [{ ...direct, behaviorHints: { notWebReady: false, bingeGroup: "aiostre-am" } }] }));
@@ -1234,12 +1449,14 @@ const server = http.createServer(async (req, res) => {
         res.end(jsonSafe({ streams: [] }));
         return;
       }
-      const fileAt = hash ? await fileIndexFor(hash, id) : 0;
+      // A public indexer names the file itself (`fileIdx: 15` for S01E16); the engine
+      // file list is empty until metadata loads, so asking it first would play episode 1.
+      const fileAt = Number.isInteger(top.fileIdx) ? top.fileIdx : (hash ? await fileIndexFor(hash, id) : 0);
       const streams = [{
         ...(hash ? {} : top),
         name: ADDON_NAME,
         title: label,
-        url: hash ? `${engine}/${hash}/${fileAt}` : (live.target || `${pubBase}/play/${type}/${encodeURIComponent(id)}`),
+        url: hash ? withTrackers(`${engine}/${hash}/${fileAt}`, top) : (live.target || `${pubBase}/play/${type}/${encodeURIComponent(id)}`),
         behaviorHints: { notWebReady: false, bingeGroup: 'aiostre-am' },
       }];
       if (hash) keepWarm(hash, fileAt);
