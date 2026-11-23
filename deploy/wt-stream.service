@@ -1,0 +1,19 @@
+[Unit]
+Description=WebTorrent streaming sidecar for the Stremio addon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wt-test
+Environment=WT_PORT=11471
+# One `npm i webtorrent` in WorkingDirectory before the first start.
+ExecStart=/usr/bin/node /opt/wt-test/wt-stream.js
+Restart=always
+RestartSec=5
+# The client keeps its torrents in memory; a restart drops them, so it must not
+# restart for a bad range request. The server guards its own streams for that.
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
