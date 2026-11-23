@@ -1160,10 +1160,11 @@ async function firstLiveHttp(list) {
 // plays for five seconds and stalls.
 // Commit to the winning source: the sidecar drops every other torrent, selects
 // only this episode, and buffers a cushion before the player's first request.
-function commitSource(hash, idx, id) {
+function commitSource(hash, idx, id, needMbps) {
   return new Promise((resolve) => {
     const index = Number.isInteger(idx) ? String(idx) : "";
-    const query = `?ms=25000&mb=12&idx=${index}&id=${encodeURIComponent(id || "")}`;
+    const need = Number(needMbps) || 0;
+    const query = `?ms=25000&mb=12&need=${need}&idx=${index}&id=${encodeURIComponent(id || "")}`;
     const req = http.get(`${STREAMING}/commit/${hash}${query}`, { timeout: 32000 }, (res) => {
       let body = "";
       res.setEncoding("utf8");
@@ -1351,25 +1352,36 @@ const server = http.createServer(async (req, res) => {
         // An episode runs 40-50 minutes and a film about ninety: close enough to
         // turn a file size into the bitrate the player will demand of the swarm.
         const assumedSeconds = type === "series" ? 2700 : 6600;
+        // The probe ranks the swarms; the commit is what proves the winner. A
+        // candidate that cannot buffer its first megabytes, or whose measured
+        // rate is under the bitrate the file needs, is a source the player opens
+        // and then starves - which is the "Exo failed: illegal argument" a
+        // viewer sees. Try the next one instead of handing it over.
+        const ranked = rows
+          .map((row, k) => {
+            if (!row || !row.ok || !row.length) return null;
+            const needed = (row.length * 8) / (assumedSeconds * 1e6);
+            return { ...picks[k], headroom: row.mbps / Math.max(0.25, needed), mbps: row.mbps, needed, length: row.length, idx: row.idx };
+          })
+          .filter(Boolean)
+          .sort((left, right) => right.headroom - left.headroom);
         let chosen = null;
-        rows.forEach((row, k) => {
-          if (!row || !row.ok || !row.length) return;
-          const needed = (row.length * 8) / (assumedSeconds * 1e6);
-          const headroom = row.mbps / Math.max(0.25, needed);
-          const scored = { ...picks[k], headroom, mbps: row.mbps, needed, length: row.length, idx: row.idx };
-          if (!chosen || scored.headroom > chosen.headroom) chosen = scored;
-        });
-        if (chosen) {
-          const committed = await commitSource(chosen.hash, chosen.idx, id).catch(() => null);
-          if (committed && committed.ok) {
-            chosen.idx = committed.idx;
-            chosen.mbps = committed.mbps || chosen.mbps;
-            console.log(`sidecar commit ${cacheKey}: ${chosen.hash.slice(0, 8)} idx=${committed.idx} buffered=${(committed.buffered / 1048576).toFixed(1)}MB of ${(committed.wanted / 1048576).toFixed(0)}MB in ${committed.waitedMs}ms at ${committed.mbps}Mbps`);
+        for (const candidate of ranked.slice(0, 3)) {
+          const committed = await commitSource(candidate.hash, candidate.idx, id, candidate.needed).catch(() => null);
+          if (!committed || !committed.ok) continue;
+          const need = (committed.length * 8) / (assumedSeconds * 1e6);
+          const bufferedEnough = committed.buffered >= committed.wanted * 0.9;
+          const fastEnough = committed.mbps >= need * 1.2;
+          console.log(`sidecar commit ${cacheKey}: ${candidate.hash.slice(0, 8)} idx=${committed.idx} buffered=${(committed.buffered / 1048576).toFixed(1)}MB of ${(committed.wanted / 1048576).toFixed(0)}MB at ${committed.mbps}Mbps needs ${need.toFixed(2)}Mbps -> ${bufferedEnough || fastEnough ? "take" : "skip"}`);
+          if (bufferedEnough || fastEnough) {
+            chosen = { ...candidate, idx: committed.idx, mbps: committed.mbps || candidate.mbps, needed: need };
+            break;
           }
+        }
+        if (chosen) {
           live = { at: chosen.at, hash: chosen.hash, peers: 1, rate: chosen.mbps, cachedAt: Date.now() };
           streamChoice.set(cacheKey, live);
-          const verdict = chosen.headroom >= 1.2 ? "fits" : "tight";
-          console.log(`sidecar probe ${cacheKey}: ${chosen.hash.slice(0, 8)} delivers ${chosen.mbps}Mbps, needs ${chosen.needed.toFixed(2)}Mbps (x${chosen.headroom.toFixed(2)} ${verdict}) idx=${chosen.idx}`);
+          console.log(`sidecar ready ${cacheKey}: ${chosen.hash.slice(0, 8)} ${chosen.mbps}Mbps for ${chosen.needed.toFixed(2)}Mbps needed, idx=${chosen.idx}`);
         } else {
           console.log(`sidecar probe ${cacheKey}: no candidate answered of ${list.length}`);
         }
