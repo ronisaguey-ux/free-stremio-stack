@@ -41,7 +41,14 @@ function playablePayload(payload) {
         if (PLAYABLE.test(text)) return true;
         return !UNPLAYABLE.test(text);
     });
+    // A stream that NAMES its codec is a promise; one that names nothing is a
+    // guess that may still be AV1 under an untagged release. Named-and-playable
+    // comes first, then the swarm, then the resolution, so an unnamed source
+    // only wins when nothing tagged is left.
+    const tagged = (stream) => (PLAYABLE.test(streamText(stream)) ? 1 : 0);
     kept.sort((left, right) => {
+        const promise = tagged(right) - tagged(left);
+        if (promise !== 0) return promise;
         const seeders = seedersOf(right) - seedersOf(left);
         if (seeders !== 0) return seeders;
         return resolutionOf(right) - resolutionOf(left);
