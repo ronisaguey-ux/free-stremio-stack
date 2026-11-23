@@ -27,6 +27,9 @@ const VIDEO = /\.(mkv|mp4|avi|m4v|mov|webm|ts)$/i;
 let client;
 const torrents = new Map();
 const pending = new Map();
+// hash -> ms timestamp of the last range request. A torrent in this map recently
+// is being watched, and dropping it is a 503 on the socket the player holds.
+const lastServed = new Map();
 const started = Date.now();
 
 function getTorrent(hash, budgetMs) {
@@ -278,12 +281,22 @@ async function handleCommit(res, url, hash) {
     json(res, 503, { ok: false, hash: key, error: String(err.message || err) });
     return;
   }
-  // Everything else is competing for the same peers and the same pipe.
-  for (const [other, held] of [...torrents.entries()]) {
+  // Everything else is competing for the same peers and the same pipe - except a
+  // torrent the player is reading right now. Dropping that one is what turned a
+  // range request into 503 "source unavailable" while the title was still on
+  // screen, so anything served in the last two minutes stays.
+  const IDLE_MS = 120000;
+  for (const [other] of [...torrents.entries()]) {
     if (other === key) continue;
+    const servedAt = lastServed.get(other) || 0;
+    if (Date.now() - servedAt < IDLE_MS) {
+      console.log(`commit ${key.slice(0, 8)}: keeping ${other.slice(0, 8)} (read ${Math.round((Date.now() - servedAt) / 1000)}s ago)`);
+      continue;
+    }
     try {
       client.remove(other, { destroyStore: false });
       torrents.delete(other);
+      lastServed.delete(other);
       console.log(`commit ${key.slice(0, 8)}: dropped ${other.slice(0, 8)}`);
     } catch (err) {
       console.log(`commit drop failed ${other.slice(0, 8)}: ${err && err.message}`);
@@ -335,6 +348,7 @@ async function handleCommit(res, url, hash) {
 }
 
 async function handleFile(req, res, hash, index) {
+  lastServed.set(String(hash).toLowerCase(), Date.now());
   let torrent;
   try {
     torrent = await getTorrent(hash, 30000);
