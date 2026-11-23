@@ -292,17 +292,31 @@ async function handleCommit(res, url, hash) {
   const index = pickIndex(torrent, idx, id);
   selectOnly(torrent, index);
   const file = torrent.files[index];
+  // `need` is the bitrate the file demands. A swarm that cannot reach it is not
+  // going to buffer this file however long the wait, so the wait is cut short
+  // and the addon moves to the next candidate instead of the player opening a
+  // source that starves.
+  const need = Number(url.searchParams.get('need')) || 0;
   await new Promise((resolve) => setTimeout(resolve, 500));
   const sampleAt = Date.now();
   const base = Number(torrent.downloaded || 0);
   let best = 0;
   let gained = 0;
+  let shortfall = 0;
   while (Date.now() - began < budget) {
     gained = Math.max(0, Number(torrent.downloaded || 0) - base);
     const seconds = Math.max(1, (Date.now() - sampleAt) / 1000);
     const rate = (gained * 8) / (seconds * 1e6);
     if (rate > best) best = rate;
     if (gained >= wantBytes) break;
+    const elapsed = Date.now() - sampleAt;
+    if (need > 0 && elapsed > 5000) {
+      shortfall = rate < need * 0.9 ? shortfall + 1 : 0;
+      if (shortfall >= 3) {
+        console.log(`commit ${key.slice(0, 8)} giving up: ${rate.toFixed(2)}Mbps under ${need.toFixed(2)}Mbps needed`);
+        break;
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   json(res, 200, {
@@ -315,6 +329,7 @@ async function handleCommit(res, url, hash) {
     wanted: Math.round(wantBytes),
     peers: torrent.numPeers,
     mbps: Number(best.toFixed(2)),
+    shortfall: shortfall >= 3,
     waitedMs: Date.now() - began,
   });
 }
